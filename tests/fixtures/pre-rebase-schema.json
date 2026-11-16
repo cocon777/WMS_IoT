@@ -1,0 +1,53 @@
+{
+  "sites": {
+    "ddl": "\nCREATE TABLE sites (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tname VARCHAR(128) NOT NULL, \n\tdescription VARCHAR(255) NOT NULL, \n\tPRIMARY KEY (id), \n\tUNIQUE (name)\n)\n\n",
+    "indexes": []
+  },
+  "users": {
+    "ddl": "\nCREATE TABLE users (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\temail VARCHAR(255) NOT NULL, \n\tpassword_hash VARCHAR(100) NOT NULL, \n\tfull_name VARCHAR(128) NOT NULL, \n\t`role` VARCHAR(16) NOT NULL, \n\tstatus VARCHAR(16) NOT NULL, \n\tfailed_attempts INTEGER NOT NULL, \n\tlocked_until DATETIME, \n\ttoken_version INTEGER NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tUNIQUE (email)\n)\n\n",
+    "indexes": []
+  },
+  "audit_logs": {
+    "ddl": "\nCREATE TABLE audit_logs (\n\tid BIGINT NOT NULL AUTO_INCREMENT, \n\tuser_id INTEGER, \n\taction VARCHAR(64) NOT NULL, \n\ttarget_type VARCHAR(32) NOT NULL, \n\ttarget_id VARCHAR(64) NOT NULL, \n\tip VARCHAR(45) NOT NULL, \n\tdetail VARCHAR(512) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(user_id) REFERENCES users (id)\n)\n\n",
+    "indexes": []
+  },
+  "devices": {
+    "ddl": "\nCREATE TABLE devices (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tdevice_code VARCHAR(64) NOT NULL, \n\tname VARCHAR(128) NOT NULL, \n\ttype VARCHAR(8) NOT NULL, \n\tsite_id INTEGER, \n\tstate VARCHAR(20) NOT NULL, \n\thw_version VARCHAR(32) NOT NULL, \n\tfw_version VARCHAR(32) NOT NULL, \n\tconfig_applied_version INTEGER, \n\tonline BOOL NOT NULL, \n\tlast_seen DATETIME, \n\tcreated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tUNIQUE (device_code), \n\tFOREIGN KEY(site_id) REFERENCES sites (id)\n)\n\n",
+    "indexes": []
+  },
+  "alert_rules": {
+    "ddl": "\nCREATE TABLE alert_rules (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tdevice_id INTEGER NOT NULL, \n\ttype VARCHAR(32) NOT NULL, \n\tparams_json TEXT NOT NULL, \n\tseverity VARCHAR(16) NOT NULL, \n\tenabled BOOL NOT NULL, \n\tPRIMARY KEY (id), \n\tCONSTRAINT uq_alert_rule_type UNIQUE (device_id, type), \n\tFOREIGN KEY(device_id) REFERENCES devices (id)\n)\n\n",
+    "indexes": []
+  },
+  "commands": {
+    "ddl": "\nCREATE TABLE commands (\n\tid BIGINT NOT NULL AUTO_INCREMENT, \n\tcmd_id VARCHAR(64) NOT NULL, \n\tdevice_id INTEGER NOT NULL, \n\tuser_id INTEGER, \n\taction VARCHAR(32) NOT NULL, \n\tparams_json TEXT NOT NULL, \n\tstatus VARCHAR(16) NOT NULL, \n\tsent_at DATETIME(3) NOT NULL, \n\tacked_at DATETIME(3), \n\treason VARCHAR(255) NOT NULL, \n\tPRIMARY KEY (id), \n\tUNIQUE (cmd_id), \n\tFOREIGN KEY(device_id) REFERENCES devices (id), \n\tFOREIGN KEY(user_id) REFERENCES users (id)\n)\n\n",
+    "indexes": [
+      "CREATE INDEX ix_commands_device_sent ON commands (device_id, sent_at)"
+    ]
+  },
+  "device_configs": {
+    "ddl": "\nCREATE TABLE device_configs (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tdevice_id INTEGER NOT NULL, \n\t`key` VARCHAR(64) NOT NULL, \n\tvalue VARCHAR(255) NOT NULL, \n\tversion INTEGER NOT NULL, \n\tupdated_by INTEGER, \n\tupdated_at DATETIME NOT NULL, \n\tPRIMARY KEY (id), \n\tCONSTRAINT uq_device_config_key UNIQUE (device_id, `key`), \n\tFOREIGN KEY(device_id) REFERENCES devices (id), \n\tFOREIGN KEY(updated_by) REFERENCES users (id)\n)\n\n",
+    "indexes": []
+  },
+  "device_credentials": {
+    "ddl": "\nCREATE TABLE device_credentials (\n\tid INTEGER NOT NULL AUTO_INCREMENT, \n\tdevice_id INTEGER NOT NULL, \n\tmqtt_username VARCHAR(64) NOT NULL, \n\tsecret_hash VARCHAR(64) NOT NULL, \n\tcreated_at DATETIME NOT NULL, \n\trevoked_at DATETIME, \n\tPRIMARY KEY (id), \n\tUNIQUE (device_id), \n\tFOREIGN KEY(device_id) REFERENCES devices (id), \n\tUNIQUE (mqtt_username)\n)\n\n",
+    "indexes": []
+  },
+  "telemetry": {
+    "ddl": "\nCREATE TABLE telemetry (\n\tid BIGINT NOT NULL AUTO_INCREMENT, \n\tdevice_id INTEGER NOT NULL, \n\tboot_id VARCHAR(16) NOT NULL, \n\tseq BIGINT NOT NULL, \n\tts DATETIME(3) NOT NULL, \n\treceived_at DATETIME(3) NOT NULL, \n\tdistance_cm FLOAT, \n\tlevel_pct FLOAT, \n\tflow_lpm FLOAT, \n\tflow_total_l FLOAT, \n\tpump_on BOOL, \n\trssi INTEGER, \n\tPRIMARY KEY (id), \n\tCONSTRAINT uq_telemetry_dedupe UNIQUE (device_id, boot_id, seq), \n\tFOREIGN KEY(device_id) REFERENCES devices (id)\n)\n\n",
+    "indexes": [
+      "CREATE INDEX ix_telemetry_device_ts ON telemetry (device_id, ts)"
+    ]
+  },
+  "user_devices": {
+    "ddl": "\nCREATE TABLE user_devices (\n\tuser_id INTEGER NOT NULL, \n\tdevice_id INTEGER NOT NULL, \n\tPRIMARY KEY (user_id, device_id), \n\tFOREIGN KEY(user_id) REFERENCES users (id), \n\tFOREIGN KEY(device_id) REFERENCES devices (id)\n)\n\n",
+    "indexes": []
+  },
+  "alerts": {
+    "ddl": "\nCREATE TABLE alerts (\n\tid BIGINT NOT NULL AUTO_INCREMENT, \n\tdevice_id INTEGER NOT NULL, \n\trule_id INTEGER, \n\ttype VARCHAR(32) NOT NULL, \n\tseverity VARCHAR(16) NOT NULL, \n\tvalue FLOAT NOT NULL, \n\tstate VARCHAR(8) NOT NULL, \n\topened_at DATETIME(3) NOT NULL, \n\tacked_by INTEGER, \n\tacked_at DATETIME(3), \n\tclosed_at DATETIME(3), \n\tPRIMARY KEY (id), \n\tFOREIGN KEY(device_id) REFERENCES devices (id), \n\tFOREIGN KEY(rule_id) REFERENCES alert_rules (id), \n\tFOREIGN KEY(acked_by) REFERENCES users (id)\n)\n\n",
+    "indexes": [
+      "CREATE INDEX ix_alerts_device_state ON alerts (device_id, state)",
+      "CREATE INDEX ix_alerts_opened ON alerts (opened_at)"
+    ]
+  }
+}
