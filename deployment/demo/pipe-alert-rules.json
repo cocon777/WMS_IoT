@@ -1,0 +1,5 @@
+{
+  "rules": [
+    {"type": "PUMP_NO_RISE", "enabled": true, "params": {"rise_window_s": 15, "min_rise_pct": 3, "cooldown_s": 30}}
+  ]
+}

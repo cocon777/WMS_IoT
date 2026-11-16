@@ -1,0 +1,11 @@
+flowchart TB
+  ESP1[ESP32 tank] -->|LAN MQTT TLS18883| MQ
+  ESP2[ESP32 pipe] -->|LAN MQTT TLS18883| MQ
+  Browser[Trinh duyet] -->|HTTPS8443 WSS| NGINX
+  subgraph Docker Compose
+    NGINX[frontend nginx] -->|api va ws| BE[backend FastAPI mot worker]
+    MQ[mosquitto dynsec] <--> BE
+    BE --> MYSQL[(mysql 8 migrations)]
+  end
+  CA[CA demo pin trong firmware] -.-> ESP1
+  CA -.-> ESP2

@@ -1,0 +1,66 @@
+name: Verify WMS handoff
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  assembly:
+    runs-on: ubuntu-latest
+    outputs:
+      complete: ${{ steps.scope.outputs.complete }}
+      firmware: ${{ steps.scope.outputs.firmware }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: python tools/check_submission.py
+      - run: python -m compileall -q backend tools tests
+      - id: scope
+        shell: bash
+        run: |
+          echo "complete=false" >> "$GITHUB_OUTPUT"
+          echo "firmware=false" >> "$GITHUB_OUTPUT"
+          if test -f docs/DA_GHEP_4_PHAN.md; then
+            echo "complete=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Assembly in progress; integrated tests deferred until PR4. This is not runtime acceptance."
+          fi
+          if test -f firmware/platformio.ini; then
+            echo "firmware=true" >> "$GITHUB_OUTPUT"
+          fi
+  backend:
+    needs: assembly
+    if: needs.assembly.outputs.complete == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install -r backend/requirements-dev.txt -r tools/requirements.txt
+      - run: python -m pytest tests -q
+      - run: python tools/rebuild_team_backend.py --check
+  firmware:
+    needs: assembly
+    if: needs.assembly.outputs.firmware == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: pip install platformio
+      - run: cp firmware/include/secrets.example.h firmware/include/secrets.h
+      - run: pio run -d firmware -e tank -e pipe
+      - run: g++ -std=c++11 -Ifirmware/include tests/firmware/control_logic_test.cpp -o /tmp/control-test && /tmp/control-test
+  frontend:
+    needs: assembly
+    if: needs.assembly.outputs.complete == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: '22'}
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.11'}
+      - run: for f in frontend/*.js; do node --check "$f"; done
+      - run: pip install -r backend/requirements-dev.txt -r tools/requirements.txt
+      - run: python -m playwright install --with-deps chromium
+      - run: python tools/smoke_frontend.py
