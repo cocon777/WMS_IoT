@@ -1,0 +1,10 @@
+{
+  "sample_interval_s": 1,
+  "tank_height_cm": 8,
+  "low_pct": 37.5,
+  "high_pct": 100,
+  "pump_max_run_s": 60,
+  "auto_mode": false,
+  "leak_flow_lpm": 0.3,
+  "leak_minutes": 1
+}

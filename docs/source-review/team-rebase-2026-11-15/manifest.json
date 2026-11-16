@@ -1,0 +1,422 @@
+{
+  "date": "2026-11-15",
+  "scope": "backend/app only; firmware, hardware, frontend, demo profile and runtime secrets preserved separately",
+  "archives": {
+    "TV2": {
+      "name": "IOT BE.zip",
+      "sha256": "6be6a7ae1f25d1aef155a790e8450b049ac1e1aa88e64f9dcb59bd90aa660f56"
+    },
+    "TV3": {
+      "name": "WMS_TV3_Local.zip",
+      "sha256": "080489d711eca6bde7435b6e79d3a2283ff0151e8a86d84432bb7798b3b9fc45"
+    }
+  },
+  "files": [
+    {
+      "path": "backend/app/__init__.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/__init__.py",
+      "base_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "result_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/access.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/access.py",
+      "base_sha256": "1be28891aa5b804ac727225b08cb82cd3d9bdf05e633c80875b6a7c299a8c9b3",
+      "result_sha256": "1be28891aa5b804ac727225b08cb82cd3d9bdf05e633c80875b6a7c299a8c9b3",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/accounts.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/accounts.py",
+      "base_sha256": "b64dc6b7b5842d5e8348901be064a75fa30d801ebba3feb515d1d82eb20e13a9",
+      "result_sha256": "2f99ae51de90a9209f4064d014b769bceb07b4e9cd5cbff00c5a5d4a03e920aa",
+      "changed": true,
+      "reason": "Keep TV2 account contracts and final-admin protection accepted from TV3."
+    },
+    {
+      "path": "backend/app/alerts.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/alerts.py",
+      "base_sha256": "460f073e9aef3c88f4bafdc9f096733e473c62f5445559a1a4be65bff398ea62",
+      "result_sha256": "2c357c09c91e387e5c72dee50978538d8ad9f414e4ab6c0467074f4ed699ac4f",
+      "changed": true,
+      "reason": "Final refill safeguards plus optional window_s/min_drop_cm/max_gap_s for20-second physical-demo leak detection. Zero defaults preserve TV2 minute windows; DB/auth/WS unchanged."
+    },
+    {
+      "path": "backend/app/audit.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/audit.py",
+      "base_sha256": "ea31a960b2d8232ca5f5f46304bf1ec766a0a2d6d11812865a07586f8ae2566c",
+      "result_sha256": "236954ff03b45804ce6db4d12a77c1bf12cf58065948e29ca7bc9c8e82f9ad55",
+      "changed": true,
+      "reason": "TV2 compatibility bridge delegates to TV3 services.audit."
+    },
+    {
+      "path": "backend/app/broker_admin.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/broker_admin.py",
+      "base_sha256": "e569fd334c90022b13d1e1e5d887fd0e20acb63b8c2c10a2a22ef94addb96e77",
+      "result_sha256": "7268029510e07177a2fbb88a005480a202729c382eb3d3d8e08085904231e8ff",
+      "changed": true,
+      "reason": "Keep tested TV2-style persistent dynsec connection, literal ACLs and TLS."
+    },
+    {
+      "path": "backend/app/commands.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/commands.py",
+      "base_sha256": "c39a1fd636907f6d03107f793ca2d9b42aa6a70ed34fcbf68795475a1387ae14",
+      "result_sha256": "4138ca4f2d15e84479beea8af8c3ab3d8105ddf334ea8a0c251a2a29761410c2",
+      "changed": true,
+      "reason": "Final accepted fresh-level/full guards, command duration/ACK contract."
+    },
+    {
+      "path": "backend/app/config.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/config.py",
+      "base_sha256": "74d24451cd7e249dcc3522fb0462aca16ba103b8d52f4ecf12e7b1ba632ef1a6",
+      "result_sha256": "444bb8026d4edc61fb478c61c67b9695b7303c1adf7fcda681069740c833bcd5",
+      "changed": true,
+      "reason": "Keep accepted environment config and proxy/IP limit settings."
+    },
+    {
+      "path": "backend/app/db.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/db.py",
+      "base_sha256": "942cd632b08085ed8bedcd484a66a319e4a8f1b466185b3d7f2239373e444196",
+      "result_sha256": "eb705552f6c8d0caf6f4aeda3c0fb702c48b8e13b207bb178df7c977d73ba33a",
+      "changed": true,
+      "reason": "TV2 DB implementation plus get_db dependency expected by TV3 packages; schema/time behavior unchanged."
+    },
+    {
+      "path": "backend/app/deps.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/deps.py",
+      "base_sha256": "0bc12daffacc6a90d7d9a0f907a1b0406a5a2eebfbfad00950627b472e9e5cd1",
+      "result_sha256": "4d58ac857754e4ce667520c215c971f30b045c0c688acbeb421a984274be19cc",
+      "changed": true,
+      "reason": "TV2 Actor return interface, real requests authorized through TV3 auth/RBAC."
+    },
+    {
+      "path": "backend/app/device_config.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/device_config.py",
+      "base_sha256": "656d8287fb891bef041019ea530fac0ba83293a210c65a279c7cb485045a05c3",
+      "result_sha256": "656d8287fb891bef041019ea530fac0ba83293a210c65a279c7cb485045a05c3",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/device_params.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/device_params.py",
+      "base_sha256": "c730b8ee183ad3a6421d87b76f86fe6b7b4abcf516b0069fe2a54951a6e97809",
+      "result_sha256": "c730b8ee183ad3a6421d87b76f86fe6b7b4abcf516b0069fe2a54951a6e97809",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/errors.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/errors.py",
+      "base_sha256": "f35c1d0ea3c8d627f2e8d741eaad133310c3da0ef09216df1da486647fcdd70d",
+      "result_sha256": "f35c1d0ea3c8d627f2e8d741eaad133310c3da0ef09216df1da486647fcdd70d",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/events.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/events.py",
+      "base_sha256": "a64d9c0e0a3bf0667d4827ba7de7e2bf1355bf90d25d3c6c09b088f5a4987def",
+      "result_sha256": "a64d9c0e0a3bf0667d4827ba7de7e2bf1355bf90d25d3c6c09b088f5a4987def",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/ingest.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/ingest.py",
+      "base_sha256": "cacd61e8b2eeddcee90ce126eb6234243bd3e26ae0ec20f782aa71318e2b4926",
+      "result_sha256": "df147abf59a370cc059f17b648d591ec15cf4eaab937aefb1345eb939650e7e6",
+      "changed": true,
+      "reason": "Keep accepted status/fw/config-applied/telemetry validation and delivery."
+    },
+    {
+      "path": "backend/app/lifecycle.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/lifecycle.py",
+      "base_sha256": "aafa57a26159d4b0f75c7b180990bcd79482b611d3fabc2e003412273148131e",
+      "result_sha256": "aafa57a26159d4b0f75c7b180990bcd79482b611d3fabc2e003412273148131e",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/login_guard.py",
+      "origin": "integration",
+      "archive_path": null,
+      "base_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "result_sha256": "c9ca81b8be3673e5e9a24876b55673193555387a0a53a44d26b3221b14add7fd",
+      "changed": true,
+      "reason": "Compatibility import: share one limiter between old and new module paths."
+    },
+    {
+      "path": "backend/app/main.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/main.py",
+      "base_sha256": "a3e166bdfbf8f3db1c9237d5d3d25b9f1e2f55175c0a2649ef88cf97bf70acbf",
+      "result_sha256": "de66f3c98bdb8e727a7adf213eb8c232340f11c9bc28eb15cdf18a9ae69b94f6",
+      "changed": true,
+      "reason": "Keep final readiness, secure startup, watchers and real event-to-WS wiring."
+    },
+    {
+      "path": "backend/app/models/__init__.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/models/__init__.py",
+      "base_sha256": "f8602663942abe78e14b5bed390c14e2ea8886a55d737ec1240bf0de3ffd71df",
+      "result_sha256": "28a04cc9a60bf9518d5f964cb02ac3369aff290769f9fcd98922b00fa01b7928",
+      "changed": true,
+      "reason": "TV3 model package layout; preserve TV2 DDL/constraints/defaults exactly to keep existing DB and device state."
+    },
+    {
+      "path": "backend/app/models/audit_log.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/models/audit_log.py",
+      "base_sha256": "bad3a719246395ad712d0cfc7724faf9cec6841056ca68b1aa788be13b248216",
+      "result_sha256": "030c93ad31bf7c9dbe146b81838447b701bf84cb1326af25cedab44c95047466",
+      "changed": true,
+      "reason": "TV3 model package layout; preserve TV2 DDL/constraints/defaults exactly to keep existing DB and device state."
+    },
+    {
+      "path": "backend/app/models/device.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/models/device.py",
+      "base_sha256": "84f0e48e0300270a09ac7085afb6760acc502d143ce22acc928471d9db7dcf8c",
+      "result_sha256": "28ac50a65962c7ebadf37f838d2d1ae0b55d3705daf7dcdd2de829756d5db7a0",
+      "changed": true,
+      "reason": "TV3 model package layout; preserve TV2 DDL/constraints/defaults exactly to keep existing DB and device state."
+    },
+    {
+      "path": "backend/app/models/user.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/models/user.py",
+      "base_sha256": "942a8c6658a2a784d5679962ec77afeeb9333fcbedc3a6a3c0cd50a449367214",
+      "result_sha256": "22b551ada4361f71e57e1ba704c468e27d1b10615a3d3814e32e9fdfb89571e7",
+      "changed": true,
+      "reason": "TV3 model package layout; preserve TV2 DDL/constraints/defaults exactly to keep existing DB and device state."
+    },
+    {
+      "path": "backend/app/mqtt_client.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/mqtt_client.py",
+      "base_sha256": "2c3f023026599f309d5d433ee9ab418e853475618f9df5ed8dfd38383d27f6b4",
+      "result_sha256": "c179de7e7c3d8af1791f6a9f208c2119224cf6007636693be01905c4fb6133db",
+      "changed": true,
+      "reason": "Keep accepted TLS subscriptions/readiness/ingest behavior."
+    },
+    {
+      "path": "backend/app/realtime.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/realtime.py",
+      "base_sha256": "2b27aefb099a662b0a369c6f9b825389b9ce05ee8be880fe960bb41e873b6aed",
+      "result_sha256": "2b27aefb099a662b0a369c6f9b825389b9ce05ee8be880fe960bb41e873b6aed",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/retention.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/retention.py",
+      "base_sha256": "f750b5a23b70cece0b7c076049c8524c71e5b5bfaf63cfd479e747022cf356d1",
+      "result_sha256": "f750b5a23b70cece0b7c076049c8524c71e5b5bfaf63cfd479e747022cf356d1",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/__init__.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/__init__.py",
+      "base_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "result_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/alerts.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/alerts.py",
+      "base_sha256": "ad6be16efc08b6a88bce7ac95ede31941b11679ef3ab8252d16ebd49b45ea2ad",
+      "result_sha256": "ad6be16efc08b6a88bce7ac95ede31941b11679ef3ab8252d16ebd49b45ea2ad",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/audit.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/audit.py",
+      "base_sha256": "8e6fbd0a16f3ff8ee06ccbf69cac52d404ecc1710ef80227e7be3cc1c7302e98",
+      "result_sha256": "8e6fbd0a16f3ff8ee06ccbf69cac52d404ecc1710ef80227e7be3cc1c7302e98",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/auth.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/auth.py",
+      "base_sha256": "cb21a895df1f18c740cd57bcf96fe7071a6d0e29e86ad01aea4f99d9ba9b0979",
+      "result_sha256": "19d3c1da742498e4ed14fad92560e05f39d341ac4221ab203ef9a5a3b648ff4d",
+      "changed": true,
+      "reason": "Keep existing REST payload/token response/account workflow; shared TV3 package below."
+    },
+    {
+      "path": "backend/app/routers/commands.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/commands.py",
+      "base_sha256": "c0ce76d4b5f56028c0030bd38d26ca732325155cb402c6b462ef6ef1e727ea0b",
+      "result_sha256": "c0ce76d4b5f56028c0030bd38d26ca732325155cb402c6b462ef6ef1e727ea0b",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/config.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/config.py",
+      "base_sha256": "1ce91dceb51f4bbca9a414fdeac09add51ca6a15ef9cb82190879b9c6155d8ad",
+      "result_sha256": "1ce91dceb51f4bbca9a414fdeac09add51ca6a15ef9cb82190879b9c6155d8ad",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/devices.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/devices.py",
+      "base_sha256": "6f19fdb530fe237ee5f10fdd353a4753ce089c2089aaac1170148e33cbd41997",
+      "result_sha256": "6f19fdb530fe237ee5f10fdd353a4753ce089c2089aaac1170148e33cbd41997",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/sites.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/sites.py",
+      "base_sha256": "1c85373e348071d880f14c1c693497e04fe412df05e397c52a675a1482ec8e2f",
+      "result_sha256": "1c85373e348071d880f14c1c693497e04fe412df05e397c52a675a1482ec8e2f",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/telemetry.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/telemetry.py",
+      "base_sha256": "be1b89d59f1f6c157ee6c6eb604399555d784dc5b5720c2e34c9a83d686b90c1",
+      "result_sha256": "be1b89d59f1f6c157ee6c6eb604399555d784dc5b5720c2e34c9a83d686b90c1",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/users.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/users.py",
+      "base_sha256": "31bf09d4a09afca5043eef1a391224026e91522858d3e585d52a11f27d87f297",
+      "result_sha256": "31bf09d4a09afca5043eef1a391224026e91522858d3e585d52a11f27d87f297",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/routers/ws.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/routers/ws.py",
+      "base_sha256": "53d3c791675d8680c6c61354ef2c27294c838308db65327dae49defa4ffc2822",
+      "result_sha256": "37db961e77362675579667dd631e93349bab78670d3c76cf0dc00f2b435242db",
+      "changed": true,
+      "reason": "Keep working event/data pipeline, real hub subscription and bounded cancellation cleanup."
+    },
+    {
+      "path": "backend/app/schemas.py",
+      "origin": "TV2",
+      "archive_path": "IOT BE/backend/app/schemas.py",
+      "base_sha256": "1d2b8ae20ba33b2de9503c948d34ca3938bd246ddc5eda1866b92829e2158850",
+      "result_sha256": "1d2b8ae20ba33b2de9503c948d34ca3938bd246ddc5eda1866b92829e2158850",
+      "changed": false,
+      "reason": "Unchanged from the selected original archive."
+    },
+    {
+      "path": "backend/app/security/__init__.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/security/__init__.py",
+      "base_sha256": "0730caa4c19893107fc725da7591a0a6567b5bf53cc893c9ef7b273cc0eea76b",
+      "result_sha256": "331bcf911daee40b291731ef45f4aefe6e88dce163d1fd7647c7205a8ceb53f2",
+      "changed": true,
+      "reason": "TV3 package structure; expose the TV2 token/hash interfaces without two auth systems."
+    },
+    {
+      "path": "backend/app/security/auth.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/security/auth.py",
+      "base_sha256": "59db2e258c0ba17904c5c0abc209fafcea634315f90861d86ac2071e3ea6d6b0",
+      "result_sha256": "9c1b79fe666e174698000a5d419242bcc629d20a7b38cd936df6d4004a8d02f0",
+      "changed": true,
+      "reason": "TV3 auth interface/implementation; persistent token_version, existing-token compatibility, current password policy, JWT-error adapter for WS."
+    },
+    {
+      "path": "backend/app/security/lockout.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/security/lockout.py",
+      "base_sha256": "905e06e86393f2c8a1f27aa6bec58f21788150e8d3fc19f38ea51509a0f0a3c2",
+      "result_sha256": "cf4481aa26fb1330003319ac9287be27ee81dd22907b15d234c8d812946e2bd4",
+      "changed": true,
+      "reason": "TV3 security package; bounded IP limiter/proxy handling already accepted, shared single state with TV2 compatibility import."
+    },
+    {
+      "path": "backend/app/security/rbac.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/security/rbac.py",
+      "base_sha256": "21d2897f48823ad79fb5fbd91f0e0340115003b1ada16d72d461541e091f1b24",
+      "result_sha256": "f3abd492ca56d489f541d90261bced6e4ff7356e009e72bc05d1863ab45b4229",
+      "changed": true,
+      "reason": "TV3 permission matrix and role/scope dependencies; actual Device model, denial-audit transaction ownership."
+    },
+    {
+      "path": "backend/app/services/__init__.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/services/__init__.py",
+      "base_sha256": "cd98b77b8a334c480873dbe8c40ff994973905955babcec1e6a7bf10d5ac884f",
+      "result_sha256": "871a2bc67661dffda8fca78e99f879d82be30748fe00c7fdb8a36391a742e6ca",
+      "changed": true,
+      "reason": "TV3 services package structure."
+    },
+    {
+      "path": "backend/app/services/audit.py",
+      "origin": "TV3",
+      "archive_path": "WMS_TV3_Local/backend/app/services/audit.py",
+      "base_sha256": "06080854b23c93014f8e6a7a60c16974e0c1f12dff186ef5f98040b0c0414b0d",
+      "result_sha256": "37a7c2185b744248cc761959473c012efef5e3fd9e41bb0da3e9b149961f1019",
+      "changed": true,
+      "reason": "TV3 audit service interface; recursive sanitizing and caller-owned transactions needed by TV2 lifecycle/commands."
+    }
+  ],
+  "retired_paths": [
+    "backend/app/models.py",
+    "backend/app/security.py"
+  ],
+  "counts": {
+    "TV2": 31,
+    "TV3": 11,
+    "integration": 1,
+    "unchanged_original": 19
+  },
+  "amendments": [
+    {
+      "date": "2026-11-15",
+      "files": [
+        "backend/app/alerts.py"
+      ],
+      "reason": "User requested H8/LOW20, short tabletop leak demonstration; optional rule parameters retain original behavior for other sites."
+    }
+  ]
+}

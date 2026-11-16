@@ -1,0 +1,2962 @@
+--- TV2/IOT BE/backend/app/accounts.py
++++ backend/app/accounts.py
+@@ -132,6 +132,15 @@
+     if user.id == actor_id and ((role and role != user.role) or (status and status != user.status)):
+         raise SelfLockout()
+ 
++    # TV3 last-active-admin invariant, adapted to the integrated role/status names.
++    # Lock the active Admin set in a stable order before removing an Admin.
++    if user.role == "Admin" and user.status == "active" and (
++            (role is not None and role != "Admin") or (status is not None and status != "active")):
++        admins = list(s.scalars(select(User).where(User.role == "Admin", User.status == "active")
++                                .order_by(User.id).with_for_update()))
++        if len(admins) <= 1:
++            raise Conflict("Không thể khóa hoặc hạ quyền Admin hoạt động cuối cùng")
++
+     changes = []
+     if full_name is not None and full_name != user.full_name:
+         user.full_name = full_name
+--- TV2/IOT BE/backend/app/alerts.py
++++ backend/app/alerts.py
+@@ -55,7 +55,8 @@
+         "HIGH_LEVEL": {"severity": "warning",
+                        "params": {"min_duration_s": 0, "hysteresis_pct": 5, "cooldown_s": 300}},
+         "LEAK_SUSPECT": {"severity": "critical",
+-                         "params": {"window_min": 5, "rate_cm_per_min": 0.3, "settle_s": 30, "cooldown_s": 300}},
++                         "params": {"window_min": 5, "window_s": 0, "min_drop_cm": 0, "max_gap_s": 0,
++                                    "rate_cm_per_min": 0.3, "settle_s": 30, "cooldown_s": 300}},
+         "DEVICE_OFFLINE": _OFFLINE,
+     },
+     "pipe": {
+@@ -72,6 +73,7 @@
+ PARAM_BOUNDS = {
+     "min_duration_s": (0, 3600), "hysteresis_pct": (0, 50), "cooldown_s": (0, 86400),
+     "window_min": (1, 60), "rate_cm_per_min": (0.01, 10), "settle_s": (0, 600),
++    "window_s": (0, 3600), "min_drop_cm": (0, 20), "max_gap_s": (0, 120),
+     "clear_s": (0, 3600), "usage_start_h": (0, 24), "usage_end_h": (0, 24), "utc_offset_h": (-12, 14),
+     "rise_window_s": (10, 1800), "min_rise_pct": (0, 100),
+ }
+@@ -137,6 +139,7 @@
+     last_ts: datetime | None = None
+     low_since: datetime | None = None           # node bồn
+     high_since: datetime | None = None
++    auto_attempted: bool = False  # one ON attempt per low episode, independent of alert ACK
+     leak_win: deque = field(default_factory=deque)      # (ts, level_pct) khi bơm tắt và đã ổn định
+     leak_since: datetime | None = None          # node ống: bắt đầu có dòng chảy khi bơm tắt
+     leak_clear_since: datetime | None = None
+@@ -147,6 +150,7 @@
+         self.low_since = self.high_since = self.leak_since = self.leak_clear_since = None
+         self.rise_since = self.rise_ref = None
+         self.leak_win.clear()
++        self.auto_attempted = False
+ 
+ 
+ @dataclass
+@@ -371,9 +375,9 @@
+ 
+ 
+ # ----------------------------------------------------------------------------- hành động
+-def _throttled(device_id: int, name: str) -> bool:
++def _throttled(device_id: int, name: str, interval_s: float = SAFETY_THROTTLE_S) -> bool:
+     now, key = time.monotonic(), (device_id, name)
+-    if now - _last_action.get(key, -1e9) < SAFETY_THROTTLE_S:
++    if now - _last_action.get(key, -1e9) < interval_s:
+         return True
+     _last_action[key] = now
+     return False
+@@ -391,6 +395,18 @@
+             with session_scope() as s:
+                 dev = s.get(Device, pump_device_id)
+                 if dev is not None:
++                    if value == "on" and source == "auto:LOW_LEVEL":
++                        # Recheck after queueing: user may have selected manual/OFF meanwhile.
++                        with _engine_lock:
++                            peer = _peers(s, dev).get("tank")
++                            tank = s.get(Device, peer.id) if peer else None
++                            site = _sites.get(_site_key(dev))
++                            cfg = _config(s, tank.id) if tank else None
++                            age = (utcnow() - site.level_ts).total_seconds() if site and site.level_ts else None
++                            if (not tank or tank.state != "Active" or not tank.online or not cfg["auto_mode"]
++                                    or age is None or not -2 <= age <= commands.TANK_MAX_AGE_S
++                                    or site.level is None or site.level >= float(cfg["low_pct"])):
++                                return
+                     commands.send_pump_command(s, publisher, dev, value=value, duration_s=duration_s,
+                                                actor_id=None, ip="system", source=source)
+         except (Conflict, InvalidInput, PublishError) as e:
+@@ -418,16 +434,21 @@
+     if smp.level_pct < low:
+         st.low_since = st.low_since or smp.ts
+         if (smp.ts - st.low_since).total_seconds() >= p["min_duration_s"]:
+-            alert = _raise(s, ctx, dev, rule, smp.level_pct, smp.ts)
+-            if alert and cfg["auto_mode"] and fresh and dev.state == "Active":
++            _raise(s, ctx, dev, rule, smp.level_pct, smp.ts)
++            level_fresh = -2 <= (utcnow() - smp.ts).total_seconds() <= commands.TANK_MAX_AGE_S
++            if not st.auto_attempted and cfg["auto_mode"] and fresh and level_fresh and dev.state == "Active":
+                 pipe = peers.get("pipe")
+                 if pipe is None:
+                     log.warning("LOW_LEVEL device=%s: site chưa có node ống, không thể tự bật bơm", dev.device_code)
+                 elif site.pump_at(smp.ts) is not True:          # bơm đang chạy rồi thì không cần bật lại
++                    st.auto_attempted = True
+                     ctx.actions.append(_pump_action(pipe.id, "on", None, "auto:LOW_LEVEL"))
++                else:
++                    st.auto_attempted = True
+     else:
+         st.low_since = None
+         if smp.level_pct > low + p["hysteresis_pct"]:
++            st.auto_attempted = False
+             _clear(s, ctx, dev, "LOW_LEVEL", smp.ts)
+ 
+ 
+@@ -435,7 +456,7 @@
+     if rule is None or not rule.enabled:
+         return
+     p, high = rule.params, float(cfg["high_pct"])
+-    if smp.level_pct > high:
++    if smp.level_pct >= high:  # clamped 100% must also trigger full-level OFF
+         st.high_since = st.high_since or smp.ts
+         if (smp.ts - st.high_since).total_seconds() >= p["min_duration_s"]:
+             _raise(s, ctx, dev, rule, smp.level_pct, smp.ts)
+@@ -443,7 +464,7 @@
+             # chạy HOẶC không biết trạng thái bơm (an toàn hơn là bỏ qua); chỉ bỏ qua khi biết chắc bơm đã tắt.
+             pipe = peers.get("pipe")
+             if (pipe is not None and fresh and site.pump_at(smp.ts) is not False
+-                    and not _throttled(pipe.id, "high_off")):
++                    and not _throttled(pipe.id, "high_off", 2)):
+                 ctx.actions.append(_pump_action(pipe.id, "off", None, "auto:HIGH_LEVEL"))
+     else:
+         st.high_since = None
+@@ -451,7 +472,7 @@
+             _clear(s, ctx, dev, "HIGH_LEVEL", smp.ts)
+ 
+ 
+-def _drop_rate_cm_per_min(win, tank_height_cm: float) -> float | None:
++def _drop_stats(win, tank_height_cm: float) -> tuple[float, float] | None:
+     """Tốc độ giảm mực (cm/phút, dương = đang giảm) từ trung vị nhóm mẫu đầu và nhóm mẫu cuối của cửa sổ."""
+     n = len(win)
+     k = max(3, min(5, n // 4))
+@@ -463,7 +484,13 @@
+     if minutes <= 0:
+         return None
+     drop_pct = statistics.median(v for _, v in first) - statistics.median(v for _, v in last)
+-    return drop_pct / 100.0 * tank_height_cm / minutes
++    drop_cm = drop_pct / 100.0 * tank_height_cm
++    return drop_cm / minutes, drop_cm
++
++
++def _drop_rate_cm_per_min(win, tank_height_cm: float) -> float | None:
++    stats = _drop_stats(win, tank_height_cm)
++    return stats[0] if stats is not None else None
+ 
+ 
+ def _rule_leak_level(s, ctx, dev, rule, cfg, st: _DevState, site: _SiteState, peers, smp: Sample, fresh: bool) -> None:
+@@ -472,22 +499,32 @@
+     if rule is None or not rule.enabled:
+         return
+     p = rule.params
++    max_gap = p["max_gap_s"]
++    if max_gap and (not -2 <= (utcnow() - smp.ts).total_seconds() <= max_gap
++                    or site.pump_ts is None or abs((smp.ts - site.pump_ts).total_seconds()) > max_gap):
++        st.leak_win.clear()
++        return
+     if site.pump_at(smp.ts) is not False or site.pump_off_since is None:
+         st.leak_win.clear()
+         return
+     if (smp.ts - site.pump_off_since).total_seconds() < p["settle_s"]:      # chờ mặt nước lắng sau khi tắt bơm
+         return
+     win = st.leak_win
++    if max_gap and win and (smp.ts - win[-1][0]).total_seconds() > max_gap:
++        win.clear()
+     win.append((smp.ts, smp.level_pct))
+-    horizon = p["window_min"] * 60 + 2 * float(cfg["sample_interval_s"])
++    # window_s=0 preserves the original TV2 minute-based rule for existing sites.
++    window_s = p["window_s"] or p["window_min"] * 60
++    horizon = window_s + 2 * float(cfg["sample_interval_s"])
+     while (smp.ts - win[0][0]).total_seconds() > horizon:
+         win.popleft()
+-    if (win[-1][0] - win[0][0]).total_seconds() < p["window_min"] * 60:
+-        return
+-    rate = _drop_rate_cm_per_min(win, float(cfg["tank_height_cm"]))
+-    if rate is None:
+-        return
+-    if rate > p["rate_cm_per_min"]:
++    if (win[-1][0] - win[0][0]).total_seconds() < window_s:
++        return
++    stats = _drop_stats(win, float(cfg["tank_height_cm"]))
++    if stats is None:
++        return
++    rate, drop_cm = stats
++    if rate > p["rate_cm_per_min"] and drop_cm >= p["min_drop_cm"]:
+         _raise(s, ctx, dev, rule, rate, smp.ts)
+     elif rate <= p["rate_cm_per_min"] / 2:      # hysteresis: "mực ổn định" = tốc độ giảm <= nửa ngưỡng
+         _clear(s, ctx, dev, "LEAK_SUSPECT", smp.ts)
+@@ -553,6 +590,23 @@
+ 
+ TANK_RULES = (("LOW_LEVEL", _rule_low), ("HIGH_LEVEL", _rule_high), ("LEAK_SUSPECT", _rule_leak_level))
+ PIPE_RULES = (("LEAK_SUSPECT", _rule_leak_flow), ("PUMP_NO_RISE", _rule_no_rise))
++
++
++def _guard_running_pump(s, ctx, dev, site, peers, smp):
++    """A live pipe sample stops a running pump on stale tank data or full level."""
++    if not smp.pump_on or not -2 <= (utcnow() - smp.ts).total_seconds() <= commands.TANK_MAX_AGE_S:
++        return
++    tank_peer = peers.get("tank")
++    if tank_peer is None:
++        return  # legacy standalone pipe; the demo always has a paired tank
++    tank = s.get(Device, tank_peer.id)
++    age = (utcnow() - site.level_ts).total_seconds() if site.level_ts else None
++    if tank is None or tank.state != "Active" or not tank.online or age is None or not -2 <= age <= commands.TANK_MAX_AGE_S:
++        if not _throttled(dev.id, "level_stale_off", 2):
++            ctx.actions.append(_pump_action(dev.id, "off", None, "guard:STALE_LEVEL"))
++    elif site.level is not None and site.level >= float(_config(s, tank.id)["high_pct"]):
++        if not _throttled(dev.id, "high_off", 2):
++            ctx.actions.append(_pump_action(dev.id, "off", None, "auto:HIGH_LEVEL"))
+ 
+ 
+ def _evaluate(s: Session, ctx: _Ctx, smp: Sample) -> None:
+@@ -578,6 +632,7 @@
+         if smp.flow_lpm is None or smp.pump_on is None:
+             return
+         site.set_pump(smp.ts, smp.pump_on)
++        _guard_running_pump(s, ctx, dev, site, peers, smp)
+         chain = PIPE_RULES
+     for type_, fn in chain:
+         fn(s, ctx, dev, rules.get(type_), cfg, st, site, peers, smp, fresh)
+--- TV3/WMS_TV3_Local/backend/app/audit.py
++++ backend/app/audit.py
+@@ -1,31 +1,2 @@
+-"""Bridge module connecting TV2's transactional `write_audit` to TV3's `services.audit` sanitizer."""
+-
+-from sqlalchemy.orm import Session
+-
+-from app.models.audit_log import AuditLog
+-from app.services.audit import _sanitize_detail, log
+-
+-__all__ = ["log", "write_audit"]
+-
+-
+-def write_audit(
+-    s: Session,
+-    user_id: int | None,
+-    action: str,
+-    target_type: str,
+-    target_id: int | str,
+-    ip: str,
+-    detail: str = "",
+-) -> None:
+-    """Add a sanitized AuditLog entry to the active session `s` (committed with caller transaction)."""
+-    sanitized = _sanitize_detail(detail) or ""
+-    s.add(
+-        AuditLog(
+-            user_id=user_id,
+-            action=action,
+-            target_type=target_type,
+-            target_id=str(target_id),
+-            ip=(ip or "")[:64],
+-            detail=sanitized[:512],
+-        )
+-    )
++"""TV2 compatibility import for the TV3 audit service."""
++from .services.audit import sanitize_detail, write_audit
+--- TV2/IOT BE/backend/app/broker_admin.py
++++ backend/app/broker_admin.py
+@@ -1,8 +1,8 @@
+ """Quản lý tài khoản thiết bị trên Mosquitto (Cách 1 ở mục 5: Dynamic Security).
+ 
+-Cần phía broker (TV3): bật plugin mosquitto_dynamic_security, và tài khoản `backend`
+-(MQTT_USERNAME) có quyền admin dynsec. Kiểm tra tài liệu theo phiên bản Mosquitto đang dùng:
+-tên ACL type, và việc hỗ trợ %u trong topic của role.
++Cần phía broker (TV3): bật plugin mosquitto_dynamic_security, tài khoản quản trị
++MQTT_ADMIN_USERNAME tách khỏi MQTT_USERNAME truyền dữ liệu. Mosquitto 2.0 chưa
++thay thế %u: cấp role với topic cụ thể cho từng username đã kiểm tra hợp lệ.
+ Cách 2 (password_file + restart) có thể cài thêm như một lớp BrokerAdmin khác.
+ """
+ import json
+@@ -43,27 +43,29 @@
+ class DynSecAdmin(BrokerAdmin):
+     TOPIC = "$CONTROL/dynamic-security/v1"
+     ROLE = "wms-device"
+-    # (acltype, topic): %u = username = deviceId, nên 1 role dùng cho mọi thiết bị
++    # Templates expanded by Python, never passed as %u to a Mosquitto 2.0 broker.
+     DEVICE_ACLS = [
+         ("publishClientSend", "wms/%u/telemetry"),
+         ("publishClientSend", "wms/%u/status"),
+         ("publishClientSend", "wms/%u/ack"),
+         ("publishClientReceive", "wms/%u/cmd"),
+         ("publishClientReceive", "wms/%u/config"),
+-        ("subscribeLiteral", "wms/%u/cmd"),
+-        ("subscribeLiteral", "wms/%u/config"),
++        ("subscribePattern", "wms/%u/cmd"),
++        ("subscribePattern", "wms/%u/config"),
+     ]
+     TIMEOUT_S = 5.0
+ 
+     def __init__(self) -> None:
+         self._client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
+                                    client_id=f"{settings.mqtt_client_id}-dynsec")
+-        self._client.username_pw_set(settings.mqtt_username, settings.mqtt_password)
++        self._client.username_pw_set(settings.mqtt_admin_username or settings.mqtt_username,
++                                     settings.mqtt_admin_password or settings.mqtt_password)
+         if settings.mqtt_tls:
+             self._client.tls_set(ca_certs=settings.mqtt_ca_file or None)
+         self._client.reconnect_delay_set(min_delay=1, max_delay=30)
+         self._client.on_connect = self._on_connect
+         self._client.on_subscribe = self._on_subscribe
++        self._client.on_disconnect = self._on_disconnect
+         self._client.on_message = self._on_message
+         self._ready = threading.Event()          # đã subscribe xong topic response
+         self._pending: dict[str, tuple[threading.Event, dict]] = {}
+@@ -87,7 +89,14 @@
+         client.subscribe(f"{self.TOPIC}/response", qos=1)
+ 
+     def _on_subscribe(self, client, userdata, mid, reason_codes, properties):
+-        self._ready.set()
++        if reason_codes and all(not code.is_failure for code in reason_codes):
++            self._ready.set()
++        else:
++            log.error("dynsec response subscription rejected")
++
++    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
++        self._ready.clear()
++        self._role_ready = False
+ 
+     def _on_message(self, client, userdata, msg):
+         try:
+@@ -102,7 +111,7 @@
+                 entry[0].set()
+ 
+     # -- gửi lệnh và chờ phản hồi --
+-    def _send(self, command: dict) -> None:
++    def _send(self, command: dict) -> dict:
+         if not self._ready.wait(self.TIMEOUT_S):
+             raise BrokerError("không kết nối được tới broker (dynsec)")
+         cid = uuid.uuid4().hex
+@@ -119,6 +128,7 @@
+                 self._pending.pop(cid, None)
+         if box.get("error"):
+             raise BrokerError(str(box["error"]))
++        return box
+ 
+     def _send_ignoring(self, command: dict, *phrases: str) -> None:
+         try:
+@@ -127,27 +137,37 @@
+             if not any(p in str(e).lower() for p in phrases):
+                 raise
+ 
+-    def _ensure_role(self) -> None:
+-        if self._role_ready:
+-            return
+-        self._send_ignoring({"command": "createRole", "rolename": self.ROLE}, "already exists")
++    def _ensure_role(self, username: str) -> str:
++        # Mosquitto 2.0 dynsec does NOT substitute %u. Use one explicit role per node,
++        # which also works on 2.1 without granting wildcard access between devices.
++        role = f"{self.ROLE}-{username}"
++        self._send_ignoring({"command": "createRole", "rolename": role}, "already exists")
+         for acltype, topic in self.DEVICE_ACLS:
+-            self._send_ignoring({"command": "addRoleACL", "rolename": self.ROLE, "acltype": acltype,
+-                                 "topic": topic, "allow": True, "priority": 0}, "already exists")
+-        self._role_ready = True
++            self._send_ignoring({"command": "addRoleACL", "rolename": role,
++                                 "acltype": "subscribeLiteral" if acltype == "subscribePattern" else acltype,
++                                 "topic": topic.replace("%u", username), "allow": True, "priority": 0}, "already exists")
++        return role
++
++    def _assign_role(self, username: str, role: str) -> None:
++        # 2.0 reports an unhelpful 'Internal error' for duplicate addClientRole.
++        # Inspect existing roles instead of swallowing unrelated internal errors.
++        client = self._send({"command": "getClient", "username": username})["data"]["client"]
++        if not any(r["rolename"] == role for r in client.get("roles", [])):
++            self._send({"command": "addClientRole", "username": username, "rolename": role, "priority": 0})
+ 
+     # -- API cho lifecycle --
+     def create_client(self, username: str, password: str) -> None:
+-        self._ensure_role()
++        role = self._ensure_role(username)
+         try:
+             self._send({"command": "createClient", "username": username, "password": password,
+-                        "roles": [{"rolename": self.ROLE}]})
++                        "roles": [{"rolename": role}]})
+         except BrokerError as e:
+             if "already exists" not in str(e).lower():
+                 raise
+             # Tài khoản mồ côi từ lần cấp lỗi trước: đặt lại mật khẩu mới
+             self._send({"command": "setClientPassword", "username": username, "password": password})
+             self._send({"command": "enableClient", "username": username})
++            self._assign_role(username, role)
+ 
+     def set_enabled(self, username: str, enabled: bool) -> None:
+         # disableClient ngắt kết nối đang có của client
+@@ -156,6 +176,7 @@
+     def delete_client(self, username: str) -> None:
+         # deleteClient cũng ngắt kết nối ngay; không tìm thấy = coi như đã xóa
+         self._send_ignoring({"command": "deleteClient", "username": username}, "not found")
++        self._send_ignoring({"command": "deleteRole", "rolename": f"{self.ROLE}-{username}"}, "not found")
+ 
+ 
+ _instance: BrokerAdmin | None = None
+--- TV2/IOT BE/backend/app/commands.py
++++ backend/app/commands.py
+@@ -20,12 +20,29 @@
+ from .errors import InvalidInput, PublishError
+ from .events import emit
+ from .lifecycle import Conflict
+-from .models import Command, Device
++from .models import Command, Device, Telemetry
+ from .schemas import AckIn
+ 
+ log = logging.getLogger("commands")
+ 
+ ACK_STATES = {"Active", "Offline", "Fault"}     # trạng thái vẫn nhận ack (Offline: ack muộn sau khi nối lại)
++TANK_MAX_AGE_S = 5  # demo level interval is 1s
++
++
++def check_paired_tank(s: Session, dev: Device) -> None:
++    """Guard manual ON in a paired site; retain legacy standalone pipe support."""
++    if dev.site_id is None:
++        return
++    tank = s.scalar(select(Device).where(Device.site_id == dev.site_id, Device.type == "tank"))
++    if tank is None or tank.state != "Active" or not tank.online:
++        raise Conflict("Node bồn cùng site chưa sẵn sàng; không bật bơm")
++    sample = s.scalar(select(Telemetry).where(Telemetry.device_id == tank.id)
++                      .order_by(Telemetry.ts.desc(), Telemetry.id.desc()).limit(1))
++    age = (utcnow() - sample.ts).total_seconds() if sample is not None else None
++    if age is None or not -2 <= age <= TANK_MAX_AGE_S or sample.level_pct is None:
++        raise Conflict("Chưa có mực nước mới trong 5 giây; không bật bơm")
++    if sample.level_pct >= float(get_config(s, tank.id)["high_pct"]):
++        raise Conflict("Bồn đã đạt mức đầy; không bật bơm")
+ 
+ 
+ class Publisher(Protocol):
+@@ -50,6 +67,8 @@
+     if not dev.online:
+         raise Conflict("Thiết bị đang offline, không nhận lệnh bơm")
+     if value == "on":
++        if source is None:  # AUTO checks its current level sample in the alert engine.
++            check_paired_tank(s, dev)
+         # Giới hạn = min(trần cứng của hệ thống, pump_max_run_s trong cấu hình thiết bị): thiết bị tự ngắt ở mức đó
+         max_s = min(settings.pump_max_duration_s, int(get_config(s, dev.id)["pump_max_run_s"]))
+         duration_s = duration_s or min(settings.pump_default_duration_s, max_s)
+--- TV2/IOT BE/backend/app/config.py
++++ backend/app/config.py
+@@ -21,6 +21,8 @@
+     mqtt_tls: bool = False          # bật khi Mosquitto đã cấu hình TLS (cổng 8883)
+     mqtt_ca_file: str = ""
+     mqtt_client_id: str = "wms-backend"
++    mqtt_admin_username: str = ""  # production: separate account for dynsec, no shared data credentials
++    mqtt_admin_password: str = ""
+ 
+     # "dynsec": quản lý tài khoản thiết bị qua Mosquitto Dynamic Security; "none": chỉ ghi log (dev)
+     broker_admin: str = "none"  # none = chỉ ghi log (dev); dynsec = Mosquitto Dynamic Security
+@@ -31,6 +33,9 @@
+     min_password_len: int = 8  # độ dài mật khẩu tối thiểu
+     login_max_attempts: int = 5     # sai liên tiếp quá số này thì khóa tạm (S6)
+     lockout_minutes: int = 15  # thời gian khóa tạm sau khi đăng nhập sai quá số lần
++    login_ip_max_attempts: int = 60  # shared hotspot/NAT; account lockout remains 5 failures
++    login_ip_window_s: int = 60
++    trusted_proxy_cidrs: str = ""  # trust X-Real-IP only from explicitly trusted reverse proxies
+     # Lệnh bơm
+     command_timeout_s: int = 5          # không có ack sau số giây này thì ghi timeout
+     pump_default_duration_s: int = 60  # thời gian bơm mặc định của lệnh, giây
+--- TV2/IOT BE/backend/app/db.py
++++ backend/app/db.py
+@@ -1,50 +1,59 @@
+-from contextlib import contextmanager
+-from datetime import datetime, timezone
+-
+-from sqlalchemy import create_engine, event
+-from sqlalchemy.orm import DeclarativeBase, sessionmaker
+-
+-from .config import settings
+-
+-if settings.is_sqlite:
+-    # check_same_thread=False: backend dùng nhiều thread (MQTT, watcher, request), mỗi kết nối chỉ một thread dùng tại một thời điểm.
+-    # timeout: thread ghi đến sau đợi tối đa 15 giây thay vì báo "database is locked" ngay.
+-    _connect_args = {"timeout": 15, "check_same_thread": False}
+-elif settings.database_url.startswith("mysql"):
+-    _connect_args = {"init_command": "SET time_zone='+00:00'"}
+-else:
+-    _connect_args = {}
+-engine = create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=1800,
+-                       connect_args=_connect_args)
+-
+-if settings.is_sqlite:
+-    @event.listens_for(engine, "connect")
+-    def _sqlite_pragmas(dbapi_connection, _record):
+-        cur = dbapi_connection.cursor()
+-        cur.execute("PRAGMA journal_mode=WAL")       # người đọc không chặn người ghi
+-        cur.execute("PRAGMA synchronous=NORMAL")     # an toàn với WAL, nhanh hơn FULL
+-        cur.execute("PRAGMA foreign_keys=ON")        # SQLite mặc định KHÔNG thực thi khóa ngoại
+-        cur.close()
+-SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+-
+-
+-class Base(DeclarativeBase):
+-    pass
+-
+-
+-def utcnow() -> datetime:
+-    """Thời gian UTC dạng naive; toàn bộ DB lưu UTC."""
+-    return datetime.now(timezone.utc).replace(tzinfo=None)
+-
+-
+-@contextmanager
+-def session_scope():
+-    s = SessionLocal()
+-    try:
+-        yield s
+-        s.commit()
+-    except Exception:
+-        s.rollback()
+-        raise
+-    finally:
+-        s.close()
++from contextlib import contextmanager
++from datetime import datetime, timezone
++
++from sqlalchemy import create_engine, event
++from sqlalchemy.orm import DeclarativeBase, sessionmaker
++
++from .config import settings
++
++if settings.is_sqlite:
++    # check_same_thread=False: backend dùng nhiều thread (MQTT, watcher, request), mỗi kết nối chỉ một thread dùng tại một thời điểm.
++    # timeout: thread ghi đến sau đợi tối đa 15 giây thay vì báo "database is locked" ngay.
++    _connect_args = {"timeout": 15, "check_same_thread": False}
++elif settings.database_url.startswith("mysql"):
++    _connect_args = {"init_command": "SET time_zone='+00:00'"}
++else:
++    _connect_args = {}
++engine = create_engine(settings.database_url, pool_pre_ping=True, pool_recycle=1800,
++                       connect_args=_connect_args)
++
++if settings.is_sqlite:
++    @event.listens_for(engine, "connect")
++    def _sqlite_pragmas(dbapi_connection, _record):
++        cur = dbapi_connection.cursor()
++        cur.execute("PRAGMA journal_mode=WAL")       # người đọc không chặn người ghi
++        cur.execute("PRAGMA synchronous=NORMAL")     # an toàn với WAL, nhanh hơn FULL
++        cur.execute("PRAGMA foreign_keys=ON")        # SQLite mặc định KHÔNG thực thi khóa ngoại
++        cur.close()
++SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
++
++
++class Base(DeclarativeBase):
++    pass
++
++
++def utcnow() -> datetime:
++    """Thời gian UTC dạng naive; toàn bộ DB lưu UTC."""
++    return datetime.now(timezone.utc).replace(tzinfo=None)
++
++
++@contextmanager
++def session_scope():
++    s = SessionLocal()
++    try:
++        yield s
++        s.commit()
++    except Exception:
++        s.rollback()
++        raise
++    finally:
++        s.close()
++
++
++def get_db():
++    """TV3 dependency interface; one short-lived Session per request."""
++    session = SessionLocal()
++    try:
++        yield session
++    finally:
++        session.close()
+--- TV2/IOT BE/backend/app/deps.py
++++ backend/app/deps.py
+@@ -1,57 +1,27 @@
+-from dataclasses import dataclass
+-from typing import Iterator
+-
+-import jwt
+-from fastapi import Depends, HTTPException, Request
+-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+-from sqlalchemy.orm import Session
+-
+-from .db import SessionLocal
+-from .models import User
+-from .security import decode_token
+-
+-_bearer = HTTPBearer(auto_error=False)
+-
+-
+-def get_db() -> Iterator[Session]:
+-    s = SessionLocal()
+-    try:
+-        yield s
+-    finally:
+-        s.close()
+-
+-
+-@dataclass
+-class Actor:
+-    id: int
+-    role: str
+-    ip: str
+-
+-
+-def current_actor(request: Request,
+-                  creds: HTTPAuthorizationCredentials | None = Depends(_bearer),
+-                  s: Session = Depends(get_db)) -> Actor:
+-    unauthorized = HTTPException(401, "Chưa đăng nhập hoặc token không hợp lệ",
+-                                 headers={"WWW-Authenticate": "Bearer"})
+-    if creds is None:
+-        raise unauthorized
+-    try:
+-        claims = decode_token(creds.credentials)
+-        user = s.get(User, int(claims["sub"]))
+-    except (jwt.PyJWTError, ValueError, KeyError):
+-        raise unauthorized
+-    # token_version khác = đã đăng xuất / đổi mật khẩu / đổi quyền; disabled = bị khóa
+-    if user is None or user.status != "active" or user.token_version != claims.get("tv"):
+-        raise unauthorized
+-    return Actor(id=user.id, role=user.role, ip=request.client.host if request.client else "")
+-
+-
+-def require_roles(*roles: str):
+-    def dependency(actor: Actor = Depends(current_actor)) -> Actor:
+-        if actor.role not in roles:
+-            raise HTTPException(403, "Không đủ quyền")
+-        return actor
+-    return dependency
+-
+-
+-any_user = require_roles("Admin", "Operator", "Viewer")
++"""TV2 Actor interface backed by the TV3 auth/RBAC package."""
++from dataclasses import dataclass
++from fastapi import Depends, Request
++from .db import get_db
++from .models import User
++from .security.auth import get_current_user
++from .security.rbac import require_role
++
++
++@dataclass
++class Actor:
++    id: int
++    role: str
++    ip: str
++
++
++def current_actor(request: Request, user: User = Depends(get_current_user)) -> Actor:
++    return Actor(user.id, user.role, request.client.host if request.client else "")
++
++
++def require_roles(*roles: str):
++    def dependency(request: Request, user: User = Depends(require_role(*roles))) -> Actor:
++        return Actor(user.id, user.role, request.client.host if request.client else "")
++    return dependency
++
++
++any_user = require_roles("Admin", "Operator", "Viewer")
+--- TV2/IOT BE/backend/app/ingest.py
++++ backend/app/ingest.py
+@@ -132,6 +132,7 @@
+         event = {
+             "device_code": device_code, "device_id": dev.id, "type": dev.type, "site_id": dev.site_id,
+             "state": dev.state, "ts": msg.ts.isoformat() + "Z", "received_at": now.isoformat() + "Z",
++            "boot_id": msg.boot_id, "seq": msg.seq, "rssi": row.rssi,
+             "distance_cm": row.distance_cm, "level_pct": row.level_pct, "flow_lpm": row.flow_lpm,
+             "flow_total_l": row.flow_total_l, "pump_on": row.pump_on,
+         }
+--- integration/new-file
++++ backend/app/login_guard.py
+@@ -0,0 +1,4 @@
++"""Compatibility import; one limiter/state shared by TV2 and TV3 paths."""
++import sys
++from .security import lockout as _implementation
++sys.modules[__name__] = _implementation
+--- TV2/IOT BE/backend/app/main.py
++++ backend/app/main.py
+@@ -3,6 +3,8 @@
+ from contextlib import asynccontextmanager
+ 
+ from fastapi import FastAPI
++from fastapi.responses import JSONResponse
++from sqlalchemy import text
+ 
+ from . import alerts as alert_engine
+ from . import events
+@@ -58,3 +60,21 @@
+ def health():
+     """Kiểm tra dịch vụ còn sống"""
+     return {"status": "ok"}
++
++
++@app.get("/api/ready")
++def ready():
++    """Readiness of DB, application subscriptions and dynsec; no credentials returned."""
++    checks = {"database": False, "mqtt": False, "broker_admin": False}
++    try:
++        with engine.connect() as conn:
++            conn.execute(text("SELECT 1"))
++        checks["database"] = True
++    except Exception:
++        pass
++    subscriber = get_subscriber()
++    checks["mqtt"] = subscriber.client.is_connected() and subscriber.subscriptions_ready
++    admin = get_broker_admin()
++    checks["broker_admin"] = settings.broker_admin == "dynsec" and admin._ready.is_set()
++    ok = all(checks.values())
++    return JSONResponse({"status": "ready" if ok else "not_ready", "checks": checks}, status_code=200 if ok else 503)
+--- TV3/WMS_TV3_Local/backend/app/models/__init__.py
++++ backend/app/models/__init__.py
+@@ -1,32 +1,33 @@
+-"""SQLAlchemy ORM models package (unified TV2 + TV3)."""
+-
+-from app.models.audit_log import AuditLog
+-from app.models.device import (
+-    DEVICE_TYPES,
+-    Alert,
+-    AlertRule,
+-    Command,
+-    Device,
+-    DeviceConfig,
+-    DeviceCredential,
+-    Site,
+-    Telemetry,
+-)
+-from app.models.device_stub import DeviceStub
+-from app.models.user import User, UserDevice
+-
+-__all__ = [
+-    "Alert",
+-    "AlertRule",
+-    "AuditLog",
+-    "Command",
+-    "DEVICE_TYPES",
+-    "Device",
+-    "DeviceConfig",
+-    "DeviceCredential",
+-    "DeviceStub",
+-    "Site",
+-    "Telemetry",
+-    "User",
+-    "UserDevice",
+-]
++"""SQLAlchemy ORM models package (unified TV2 + TV3)."""
++
++from app.models.audit_log import AuditLog
++from app.models.device import (
++    DEVICE_TYPES,
++    Alert,
++    AlertRule,
++    Command,
++    Device,
++    DeviceConfig,
++    DeviceCredential,
++    Site,
++    Telemetry,
++)
++from app.models.user import User, UserDevice
++
++__all__ = [
++    "Alert",
++    "AlertRule",
++    "AuditLog",
++    "Command",
++    "DEVICE_TYPES",
++    "Device",
++    "DeviceConfig",
++    "DeviceCredential",
++    "Site",
++    "Telemetry",
++    "User",
++    "UserDevice",
++]
++
++# Keep public scalar types used by the TV2 code; no duplicate ORM declarations.
++from .device import BIGINT_PK, DT_MS
+--- TV3/WMS_TV3_Local/backend/app/models/audit_log.py
++++ backend/app/models/audit_log.py
+@@ -1,35 +1,25 @@
+-"""AuditLog ORM model owned by TV3."""
+-
+-from datetime import datetime, timezone
+-
+-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+-from sqlalchemy.orm import Mapped, mapped_column
+-
+-from app.db import Base
+-
+-
+-def _utcnow() -> datetime:
+-    """Return current UTC datetime."""
+-    return datetime.now(timezone.utc)
+-
+-
+-class AuditLog(Base):
+-    """Audit trail record for security-sensitive and administrative actions."""
+-
+-    __tablename__ = "audit_logs"
+-
+-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+-    user_id: Mapped[int | None] = mapped_column(
+-        Integer,
+-        ForeignKey("users.id", ondelete="SET NULL"),
+-        nullable=True,
+-        index=True,
+-    )
+-    action: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+-    target_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
+-    target_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+-    ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+-    detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+-    created_at: Mapped[datetime] = mapped_column(
+-        DateTime(timezone=True), nullable=False, default=_utcnow, index=True
+-    )
++"""AuditLog ORM model owned by TV3."""
++
++from datetime import datetime, timezone
++
++from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
++from sqlalchemy.orm import Mapped, mapped_column
++
++from app.db import Base, utcnow
++from .device import BIGINT_PK
++
++
++
++
++
++class AuditLog(Base):
++    __tablename__ = "audit_logs"
++
++    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
++    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
++    action: Mapped[str] = mapped_column(String(64))
++    target_type: Mapped[str] = mapped_column(String(32))
++    target_id: Mapped[str] = mapped_column(String(64))
++    ip: Mapped[str] = mapped_column(String(45), default="")
++    detail: Mapped[str] = mapped_column(String(512), default="")
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+--- TV3/WMS_TV3_Local/backend/app/models/device.py
++++ backend/app/models/device.py
+@@ -1,201 +1,149 @@
+-"""Core IoT domain ORM models owned by TV2 (Device, Site, Telemetry, Command, Alert, etc.)."""
+-
+-from datetime import datetime
+-
+-from sqlalchemy import (
+-    BigInteger,
+-    Boolean,
+-    DateTime,
+-    Float,
+-    ForeignKey,
+-    Index,
+-    Integer,
+-    String,
+-    Text,
+-    UniqueConstraint,
+-)
+-from sqlalchemy.dialects import mysql
+-from sqlalchemy.orm import Mapped, mapped_column
+-
+-from app.db import Base, utcnow
+-
+-# DATETIME(3): keep millisecond precision on MySQL for latency measurement
+-DT_MS = DateTime().with_variant(mysql.DATETIME(fsp=3), "mysql")
+-# BIGINT autoincrement on MySQL; SQLite only autoincrements INTEGER primary keys
+-BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
+-
+-DEVICE_TYPES = ("tank", "pipe")
+-
+-
+-class Site(Base):
+-    """Physical location/zone where water tanks and IoT nodes are deployed."""
+-
+-    __tablename__ = "sites"
+-
+-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+-    name: Mapped[str] = mapped_column(String(128), unique=True, nullable=False)
+-    description: Mapped[str] = mapped_column(String(255), default="")
+-
+-
+-class Device(Base):
+-    """IoT node / water tank device (TV2 real Device model replacing DeviceStub)."""
+-
+-    __tablename__ = "devices"
+-
+-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+-    device_code: Mapped[str] = mapped_column(
+-        String(64), unique=True, nullable=False, index=True
+-    )
+-    name: Mapped[str | None] = mapped_column(
+-        String(128), nullable=True, default=""
+-    )
+-    type: Mapped[str] = mapped_column(
+-        String(8), nullable=False, default="tank"
+-    )
+-    site_id: Mapped[int | None] = mapped_column(
+-        ForeignKey("sites.id", ondelete="SET NULL"), nullable=True
+-    )
+-    state: Mapped[str] = mapped_column(
+-        String(32), nullable=False, default="Registered", index=True
+-    )
+-    hw_version: Mapped[str] = mapped_column(String(32), default="")
+-    fw_version: Mapped[str] = mapped_column(String(32), default="")
+-    config_applied_version: Mapped[int | None] = mapped_column(
+-        Integer, nullable=True
+-    )
+-    online: Mapped[bool] = mapped_column(Boolean, default=False)
+-    last_seen: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+-
+-    def __init__(self, **kwargs: object) -> None:
+-        if "online" not in kwargs and kwargs.get("state") == "Active":
+-            kwargs["online"] = True
+-        super().__init__(**kwargs)
+-
+-
+-class DeviceCredential(Base):
+-    """Per-device MQTT credential record storing only the secret hash."""
+-
+-    __tablename__ = "device_credentials"
+-
+-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+-    device_id: Mapped[int] = mapped_column(
+-        ForeignKey("devices.id"), unique=True, nullable=False
+-    )
+-    mqtt_username: Mapped[str] = mapped_column(
+-        String(64), unique=True, nullable=False
+-    )
+-    secret_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+-    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+-
+-
+-class Telemetry(Base):
+-    """Time-series water level, flow, and pump telemetry from ESP32 nodes."""
+-
+-    __tablename__ = "telemetry"
+-    __table_args__ = (
+-        UniqueConstraint("device_id", "boot_id", "seq", name="uq_telemetry_dedupe"),
+-        Index("ix_telemetry_device_ts", "device_id", "ts"),
+-    )
+-
+-    id: Mapped[int] = mapped_column(
+-        BIGINT_PK, primary_key=True, autoincrement=True
+-    )
+-    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), nullable=False)
+-    boot_id: Mapped[str] = mapped_column(String(16), nullable=False)
+-    seq: Mapped[int] = mapped_column(BigInteger, nullable=False)
+-    ts: Mapped[datetime] = mapped_column(DT_MS, nullable=False)
+-    received_at: Mapped[datetime] = mapped_column(DT_MS, nullable=False)
+-    distance_cm: Mapped[float | None] = mapped_column(Float, nullable=True)
+-    level_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+-    flow_lpm: Mapped[float | None] = mapped_column(Float, nullable=True)
+-    flow_total_l: Mapped[float | None] = mapped_column(Float, nullable=True)
+-    pump_on: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+-    fault: Mapped[str] = mapped_column(String(64), default="", nullable=True)
+-    rssi: Mapped[int | None] = mapped_column(Integer, nullable=True)
+-
+-
+-class Command(Base):
+-    """Pump control command sent to a device with acknowledgement tracking."""
+-
+-    __tablename__ = "commands"
+-    __table_args__ = (Index("ix_commands_device_sent", "device_id", "sent_at"),)
+-
+-    id: Mapped[int] = mapped_column(
+-        BIGINT_PK, primary_key=True, autoincrement=True
+-    )
+-    cmd_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+-    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), nullable=False)
+-    user_id: Mapped[int | None] = mapped_column(
+-        ForeignKey("users.id"), nullable=True
+-    )
+-    action: Mapped[str] = mapped_column(String(32), nullable=False)
+-    params_json: Mapped[str] = mapped_column(Text, default="{}")
+-    status: Mapped[str] = mapped_column(String(16), nullable=False)  # sent | ok | fail | timeout
+-    sent_at: Mapped[datetime] = mapped_column(DT_MS, nullable=False)
+-    acked_at: Mapped[datetime | None] = mapped_column(DT_MS, nullable=True)
+-    reason: Mapped[str] = mapped_column(String(255), default="")
+-
+-
+-class DeviceConfig(Base):
+-    """Versioned key-value configuration parameters for a device."""
+-
+-    __tablename__ = "device_configs"
+-    __table_args__ = (
+-        UniqueConstraint("device_id", "key", name="uq_device_config_key"),
+-    )
+-
+-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+-    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), nullable=False)
+-    key: Mapped[str] = mapped_column(String(64), nullable=False)
+-    value: Mapped[str] = mapped_column(String(255), nullable=False)
+-    version: Mapped[int] = mapped_column(Integer, default=1)
+-    updated_by: Mapped[int | None] = mapped_column(
+-        ForeignKey("users.id"), nullable=True
+-    )
+-    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+-
+-
+-class AlertRule(Base):
+-    """Configurable alert rule per device and alert type."""
+-
+-    __tablename__ = "alert_rules"
+-    __table_args__ = (
+-        UniqueConstraint("device_id", "type", name="uq_alert_rule_type"),
+-    )
+-
+-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+-    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), nullable=False)
+-    type: Mapped[str] = mapped_column(String(32), nullable=False)
+-    params_json: Mapped[str] = mapped_column(Text, default="{}")
+-    severity: Mapped[str] = mapped_column(String(16), default="warning")
+-    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+-
+-
+-class Alert(Base):
+-    """Active or historical alert instance triggered by the alert engine."""
+-
+-    __tablename__ = "alerts"
+-    __table_args__ = (
+-        Index("ix_alerts_device_state", "device_id", "state"),
+-        Index("ix_alerts_opened", "opened_at"),
+-    )
+-
+-    id: Mapped[int] = mapped_column(
+-        BIGINT_PK, primary_key=True, autoincrement=True
+-    )
+-    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), nullable=False)
+-    rule_id: Mapped[int | None] = mapped_column(
+-        ForeignKey("alert_rules.id"), nullable=True
+-    )
+-    type: Mapped[str] = mapped_column(String(32), nullable=False)
+-    severity: Mapped[str] = mapped_column(String(16), nullable=False)
+-    value: Mapped[float] = mapped_column(Float, nullable=False)
+-    state: Mapped[str] = mapped_column(String(8), nullable=False)  # open | ack | closed
+-    opened_at: Mapped[datetime] = mapped_column(DT_MS, nullable=False)
+-    acked_by: Mapped[int | None] = mapped_column(
+-        ForeignKey("users.id"), nullable=True
+-    )
+-    acked_at: Mapped[datetime | None] = mapped_column(DT_MS, nullable=True)
+-    closed_at: Mapped[datetime | None] = mapped_column(DT_MS, nullable=True)
++"""Core IoT domain ORM models owned by TV2 (Device, Site, Telemetry, Command, Alert, etc.)."""
++
++from datetime import datetime
++
++from sqlalchemy import (
++    BigInteger,
++    Boolean,
++    DateTime,
++    Float,
++    ForeignKey,
++    Index,
++    Integer,
++    String,
++    Text,
++    UniqueConstraint,
++)
++from sqlalchemy.dialects import mysql
++from sqlalchemy.orm import Mapped, mapped_column
++
++from app.db import Base, utcnow
++
++# DATETIME(3): keep millisecond precision on MySQL for latency measurement
++DT_MS = DateTime().with_variant(mysql.DATETIME(fsp=3), "mysql")
++# BIGINT autoincrement on MySQL; SQLite only autoincrements INTEGER primary keys
++BIGINT_PK = BigInteger().with_variant(Integer, "sqlite")
++
++DEVICE_TYPES = ("tank", "pipe")
++
++
++class Site(Base):
++    """Khu vực/địa điểm đặt thiết bị (chưa có API quản lý)."""
++    __tablename__ = "sites"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    name: Mapped[str] = mapped_column(String(128), unique=True)
++    description: Mapped[str] = mapped_column(String(255), default="")
++
++
++class Device(Base):
++    """Thiết bị. Schema chuẩn nằm ở database/migrations; model này phải khớp (có test)."""
++    __tablename__ = "devices"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    device_code: Mapped[str] = mapped_column(String(64), unique=True)
++    name: Mapped[str] = mapped_column(String(128), default="")
++    type: Mapped[str] = mapped_column(String(8))                      # "tank" hoặc "pipe"
++    site_id: Mapped[int | None] = mapped_column(ForeignKey("sites.id"), nullable=True)
++    state: Mapped[str] = mapped_column(String(20), default="Registered")
++    hw_version: Mapped[str] = mapped_column(String(32), default="")
++    fw_version: Mapped[str] = mapped_column(String(32), default="")
++    config_applied_version: Mapped[int | None] = mapped_column(Integer, nullable=True)   # do thiết bị báo trong heartbeat
++    online: Mapped[bool] = mapped_column(Boolean, default=False)
++    last_seen: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
++
++
++class DeviceCredential(Base):
++    """Mỗi thiết bị 1 credential MQTT. Chỉ lưu bản băm; mật khẩu gốc chỉ hiện 1 lần khi cấp."""
++    __tablename__ = "device_credentials"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"), unique=True)
++    mqtt_username: Mapped[str] = mapped_column(String(64), unique=True)
++    secret_hash: Mapped[str] = mapped_column(String(64))
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
++    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
++
++
++class Telemetry(Base):
++    __tablename__ = "telemetry"
++    __table_args__ = (
++        UniqueConstraint("device_id", "boot_id", "seq", name="uq_telemetry_dedupe"),
++        Index("ix_telemetry_device_ts", "device_id", "ts"),
++    )
++
++    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
++    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"))
++    boot_id: Mapped[str] = mapped_column(String(16))
++    seq: Mapped[int] = mapped_column(BigInteger)
++    ts: Mapped[datetime] = mapped_column(DT_MS)             # giờ thiết bị (NTP)
++    received_at: Mapped[datetime] = mapped_column(DT_MS)    # giờ backend nhận
++    # Cột không áp dụng cho loại node thì để NULL: node bồn có distance_cm, level_pct; node ống có flow_lpm, flow_total_l, pump_on
++    distance_cm: Mapped[float | None] = mapped_column(Float, nullable=True)
++    level_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
++    flow_lpm: Mapped[float | None] = mapped_column(Float, nullable=True)
++    flow_total_l: Mapped[float | None] = mapped_column(Float, nullable=True)
++    pump_on: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
++    rssi: Mapped[int | None] = mapped_column(Integer, nullable=True)
++
++
++class Command(Base):
++    __tablename__ = "commands"
++    __table_args__ = (Index("ix_commands_device_sent", "device_id", "sent_at"),)
++
++    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
++    cmd_id: Mapped[str] = mapped_column(String(64), unique=True)
++    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"))
++    user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
++    action: Mapped[str] = mapped_column(String(32))
++    params_json: Mapped[str] = mapped_column(Text, default="{}")
++    status: Mapped[str] = mapped_column(String(16))          # sent | ok | fail | timeout
++    sent_at: Mapped[datetime] = mapped_column(DT_MS)         # lúc API nhận yêu cầu (mốc đo độ trễ lệnh)
++    acked_at: Mapped[datetime | None] = mapped_column(DT_MS, nullable=True)   # lúc backend nhận ack
++    reason: Mapped[str] = mapped_column(String(255), default="")
++
++
++class DeviceConfig(Base):
++    """Cấu hình thiết bị dạng key/value (low_pct, high_pct, auto_mode, ...). Module config sẽ ghi bảng này
++    và đẩy xuống topic config; alert engine chỉ đọc."""
++    __tablename__ = "device_configs"
++    __table_args__ = (UniqueConstraint("device_id", "key", name="uq_device_config_key"),)
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"))
++    key: Mapped[str] = mapped_column(String(64))
++    value: Mapped[str] = mapped_column(String(255))
++    version: Mapped[int] = mapped_column(Integer, default=1)
++    updated_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
++    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
++
++
++class AlertRule(Base):
++    __tablename__ = "alert_rules"
++    __table_args__ = (UniqueConstraint("device_id", "type", name="uq_alert_rule_type"),)
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"))
++    type: Mapped[str] = mapped_column(String(32))
++    params_json: Mapped[str] = mapped_column(Text, default="{}")
++    severity: Mapped[str] = mapped_column(String(16), default="warning")    # warning | critical
++    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
++
++
++class Alert(Base):
++    __tablename__ = "alerts"
++    __table_args__ = (Index("ix_alerts_device_state", "device_id", "state"),
++                      Index("ix_alerts_opened", "opened_at"))
++
++    id: Mapped[int] = mapped_column(BIGINT_PK, primary_key=True, autoincrement=True)
++    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"))
++    rule_id: Mapped[int | None] = mapped_column(ForeignKey("alert_rules.id"), nullable=True)
++    type: Mapped[str] = mapped_column(String(32))
++    severity: Mapped[str] = mapped_column(String(16))
++    value: Mapped[float] = mapped_column(Float)          # số đo gây cảnh báo (mực %, cm/phút, giây mất heartbeat...)
++    state: Mapped[str] = mapped_column(String(8))        # open | ack | closed
++    opened_at: Mapped[datetime] = mapped_column(DT_MS)
++    acked_by: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
++    acked_at: Mapped[datetime | None] = mapped_column(DT_MS, nullable=True)
++    closed_at: Mapped[datetime | None] = mapped_column(DT_MS, nullable=True)
+--- TV3/WMS_TV3_Local/backend/app/models/user.py
++++ backend/app/models/user.py
+@@ -1,70 +1,39 @@
+-"""User and UserDevice ORM models owned by TV3 (integrated with TV2)."""
+-
+-from datetime import datetime, timezone
+-
+-from sqlalchemy import DateTime, ForeignKey, Integer, String
+-from sqlalchemy.orm import Mapped, mapped_column
+-
+-from app.db import Base
+-
+-
+-def _utcnow() -> datetime:
+-    """Return current UTC datetime."""
+-    return datetime.now(timezone.utc)
+-
+-
+-class User(Base):
+-    """System user account with role, status, token_version, and login lockout tracking."""
+-
+-    __tablename__ = "users"
+-
+-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+-    email: Mapped[str] = mapped_column(
+-        String(255), unique=True, nullable=False, index=True
+-    )
+-    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+-    full_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+-    role: Mapped[str] = mapped_column(
+-        String(32), nullable=False, default="viewer", index=True
+-    )
+-    status: Mapped[str] = mapped_column(
+-        String(32), nullable=False, default="active", index=True
+-    )
+-    created_at: Mapped[datetime] = mapped_column(
+-        DateTime(timezone=True), nullable=False, default=_utcnow
+-    )
+-    failed_attempts: Mapped[int] = mapped_column(
+-        Integer, nullable=False, default=0
+-    )
+-    locked_until: Mapped[datetime | None] = mapped_column(
+-        DateTime(timezone=True), nullable=True, default=None
+-    )
+-    token_version: Mapped[int] = mapped_column(
+-        Integer, nullable=False, default=0
+-    )
+-
+-    @property
+-    def locked(self) -> bool:
+-        """Return True if account is currently within temporary lockout window."""
+-        if self.locked_until is None:
+-            return False
+-        now = datetime.now(timezone.utc)
+-        lu = (
+-            self.locked_until.replace(tzinfo=timezone.utc)
+-            if self.locked_until.tzinfo is None
+-            else self.locked_until
+-        )
+-        return lu > now
+-
+-
+-class UserDevice(Base):
+-    """Mapping table assigning accessible devices to users (Operator/Viewer)."""
+-
+-    __tablename__ = "user_devices"
+-
+-    user_id: Mapped[int] = mapped_column(
+-        Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+-    )
+-    device_id: Mapped[int] = mapped_column(
+-        Integer, ForeignKey("devices.id", ondelete="CASCADE"), primary_key=True
+-    )
++"""User and UserDevice ORM models owned by TV3 (integrated with TV2)."""
++
++from datetime import datetime, timezone
++
++from sqlalchemy import DateTime, ForeignKey, Integer, String, PrimaryKeyConstraint
++from sqlalchemy.orm import Mapped, mapped_column
++
++from app.db import Base, utcnow
++
++
++
++
++
++class User(Base):
++    __tablename__ = "users"
++
++    id: Mapped[int] = mapped_column(primary_key=True)
++    email: Mapped[str] = mapped_column(String(255), unique=True)
++    password_hash: Mapped[str] = mapped_column(String(100))
++    full_name: Mapped[str] = mapped_column(String(128), default="")
++    role: Mapped[str] = mapped_column(String(16))                 # Admin | Operator | Viewer
++    status: Mapped[str] = mapped_column(String(16), default="active")   # active | disabled
++    failed_attempts: Mapped[int] = mapped_column(Integer, default=0)
++    locked_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
++    token_version: Mapped[int] = mapped_column(Integer, default=0)      # tăng lên = hủy mọi JWT đã cấp
++    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
++
++    @property
++    def locked(self) -> bool:
++        return bool(self.locked_until and self.locked_until > utcnow())
++
++
++class UserDevice(Base):
++    """Phạm vi truy cập của Operator/Viewer (Admin thấy tất cả)."""
++    __tablename__ = "user_devices"
++    __table_args__ = (PrimaryKeyConstraint("user_id", "device_id"),)
++
++    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
++    device_id: Mapped[int] = mapped_column(ForeignKey("devices.id"))
+--- TV2/IOT BE/backend/app/mqtt_client.py
++++ backend/app/mqtt_client.py
+@@ -14,6 +14,7 @@
+ 
+ class MqttSubscriber:
+     def __init__(self) -> None:
++        self.subscriptions_ready = False
+         # client_id cố định + clean_session=False: broker giữ QoS1 trong lúc backend tạm tắt
+         self.client = mqtt.Client(
+             mqtt.CallbackAPIVersion.VERSION2,
+@@ -27,6 +28,7 @@
+         self.client.on_connect = self._on_connect
+         self.client.on_disconnect = self._on_disconnect
+         self.client.on_message = self._on_message
++        self.client.on_subscribe = self._on_subscribe
+ 
+     def start(self) -> None:
+         self.client.connect_async(settings.mqtt_host, settings.mqtt_port, keepalive=30)
+@@ -52,6 +54,7 @@
+ 
+     # Subscribe trong on_connect để tự đăng ký lại sau mỗi lần reconnect
+     def _on_connect(self, client, userdata, flags, reason_code, properties) -> None:
++        self.subscriptions_ready = False
+         if reason_code.is_failure:
+             log.error("MQTT connect failed: %s", reason_code)
+             return
+@@ -59,7 +62,13 @@
+         client.subscribe(SUBSCRIPTIONS)
+ 
+     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties) -> None:
++        self.subscriptions_ready = False
+         log.warning("MQTT disconnected: %s (sẽ tự kết nối lại)", reason_code)
++
++    def _on_subscribe(self, client, userdata, mid, reason_codes, properties) -> None:
++        self.subscriptions_ready = bool(reason_codes) and all(not code.is_failure for code in reason_codes)
++        if not self.subscriptions_ready:
++            log.error("MQTT application subscriptions rejected")
+ 
+     def _on_message(self, client, userdata, msg) -> None:
+         try:
+--- TV2/IOT BE/backend/app/routers/auth.py
++++ backend/app/routers/auth.py
+@@ -5,6 +5,7 @@
+ from .. import accounts, security
+ from ..deps import Actor, any_user, get_db
+ from ..schemas import UserOut
++from ..login_guard import check_login_rate_limit, client_ip
+ 
+ router = APIRouter(prefix="/api", tags=["auth"])
+ 
+@@ -35,10 +36,10 @@
+     return TokenOut(access_token=token, expires_in=ttl, user=UserOut.model_validate(user))
+ 
+ 
+-@router.post("/auth/login", response_model=TokenOut)
++@router.post("/auth/login", response_model=TokenOut, dependencies=[Depends(check_login_rate_limit)])
+ def login(body: LoginIn, request: Request, s: Session = Depends(get_db)):
+     """Đăng nhập, trả JWT (sai 5 lần liên tiếp thì khóa tạm 15 phút)"""
+-    ip = request.client.host if request.client else ""
++    ip = client_ip(request)
+     return _token_out(accounts.authenticate(s, body.email, body.password, ip))
+ 
+ 
+--- TV2/IOT BE/backend/app/routers/ws.py
++++ backend/app/routers/ws.py
+@@ -2,6 +2,7 @@
+ import contextlib
+ import json
+ import logging
++import anyio
+ from datetime import datetime, timezone
+ 
+ from fastapi import APIRouter, Depends, WebSocket
+@@ -85,19 +86,22 @@
+     try:
+         await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+     finally:
+-        for t in tasks:
+-            t.cancel()
+-        results = await asyncio.gather(*tasks, return_exceptions=True)
+         hub.remove(client)
+-        for r in results:
+-            if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
+-                log.debug("ws task kết thúc: %r", r)
+-        with contextlib.suppress(Exception):
+-            if client.close_error:
+-                code, message = client.close_error
+-                await websocket.send_text(json.dumps({"event": "error", "data": {"code": code, "message": message},
+-                                                      "sent_at": _iso(utcnow())}, ensure_ascii=False))
+-            await websocket.close(code=client.close_code, reason=(client.close_error or ("",))[0])
++        # Preserve cancellation, but shield bounded ASGI disconnect cleanup from
++        # repeated level-cancellation while child tasks/socket are being closed.
++        with anyio.move_on_after(2, shield=True):
++            for t in tasks:
++                t.cancel()
++            results = await asyncio.gather(*tasks, return_exceptions=True)
++            for r in results:
++                if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
++                    log.debug("ws task kết thúc: %r", r)
++            with contextlib.suppress(Exception):
++                if client.close_error:
++                    code, message = client.close_error
++                    await websocket.send_text(json.dumps({"event": "error", "data": {"code": code, "message": message},
++                                                          "sent_at": _iso(utcnow())}, ensure_ascii=False))
++                await websocket.close(code=client.close_code, reason=(client.close_error or ("",))[0])
+ 
+ 
+ @router.get("/api/metrics/latency")
+--- TV3/WMS_TV3_Local/backend/app/security/__init__.py
++++ backend/app/security/__init__.py
+@@ -1,80 +1,7 @@
+-"""Security utilities, JWT authentication, lockout, RBAC, and device guard."""
+-
+-from app.security.auth import (
+-    create_access_token,
+-    decode_access_token,
+-    get_current_user,
+-    hash_password,
+-    revoke_token,
+-    validate_password_strength,
+-    verify_dummy_password,
+-    verify_password,
+-)
+-
+-# Aliases for TV2 compatibility
+-decode_token = decode_access_token
+-create_token = create_access_token
+-dummy_verify = verify_dummy_password
+-from app.security.device_guard import (
+-    DEVICE_RATE_LIMIT_MAX_MSGS,
+-    DEVICE_RATE_LIMIT_WINDOW_SECONDS,
+-    MAX_PAYLOAD_BYTES,
+-    check_device_rate_limit,
+-    check_payload_size,
+-    inspect_incoming_message,
+-    is_device_active,
+-    reset_device_rate_limits,
+-    validate_telemetry_payload,
+-)
+-from app.security.lockout import (
+-    LOCKOUT_DURATION_MINUTES,
+-    MAX_FAILED_ATTEMPTS,
+-    check_login_rate_limit,
+-    get_client_ip,
+-    is_user_temporarily_locked,
+-    record_failed_login,
+-    reset_login_attempts,
+-    reset_rate_limiter,
+-)
+-from app.security.rbac import (
+-    PERMISSION_MATRIX,
+-    PermissionSpec,
+-    can_access_device,
+-    require_device_access,
+-    require_role,
+-)
+-
+-__all__ = [
+-    "DEVICE_RATE_LIMIT_MAX_MSGS",
+-    "DEVICE_RATE_LIMIT_WINDOW_SECONDS",
+-    "LOCKOUT_DURATION_MINUTES",
+-    "MAX_FAILED_ATTEMPTS",
+-    "MAX_PAYLOAD_BYTES",
+-    "PERMISSION_MATRIX",
+-    "PermissionSpec",
+-    "can_access_device",
+-    "check_device_rate_limit",
+-    "check_login_rate_limit",
+-    "check_payload_size",
+-    "create_access_token",
+-    "create_token",
+-    "decode_access_token",
+-    "decode_token",
+-    "dummy_verify",
+-    "get_client_ip",
+-    "get_current_user",
+-    "hash_password",
+-    "inspect_incoming_message",
+-    "is_device_active",
+-    "is_user_temporarily_locked",
+-    "record_failed_login",
+-    "require_device_access",
+-    "require_role",
+-    "reset_device_rate_limits",
+-    "reset_login_attempts",
+-    "reset_rate_limiter",
+-    "revoke_token",
+-    "validate_password_strength",
+-    "validate_telemetry_payload",
+-    "verify_password",
+-]
++"""TV3 security package with the stable TV2 public interface."""
++from .auth import ( create_access_token, create_token, decode_access_token,
++                   decode_token, dummy_verify, get_current_user, hash_password,
++                   revoke_token, validate_password_strength, verify_dummy_password,
++                   verify_password)
++
++ALGORITHM = "HS256"
+--- TV3/WMS_TV3_Local/backend/app/security/auth.py
++++ backend/app/security/auth.py
+@@ -1,229 +1,227 @@
+-"""Password hashing, JWT creation/verification, and get_current_user dependency."""
+-
+-from __future__ import annotations
+-
+-from datetime import datetime, timedelta, timezone
+-from typing import Any
+-import uuid
+-
+-import bcrypt
+-from fastapi import Depends, HTTPException, status
+-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+-import jwt
+-from sqlalchemy.orm import Session
+-
+-from app.config import settings
+-from app.db import get_db
+-from app.models.user import User
+-
+-bearer_scheme = HTTPBearer(auto_error=False)
+-
+-# Precomputed dummy bcrypt hash to mitigate timing-based user enumeration
+-_DUMMY_BCRYPT_HASH = bcrypt.hashpw(b"dummy_Timing_Defense_Secret_99!", bcrypt.gensalt()).decode(
+-    "utf-8"
+-)
+-
+-# In-memory store of revoked token JTIs (for logout within token lifetime)
+-_REVOKED_JTIS: set[str] = set()
+-
+-
+-def hash_password(plain_password: str) -> str:
+-    """Hash a plaintext password using bcrypt directly.
+-
+-    Args:
+-        plain_password: Raw password provided by the user.
+-
+-    Returns:
+-        str: Bcrypt hash string suitable for storing in `users.password_hash`.
+-    """
+-    return bcrypt.hashpw(
+-        plain_password.encode("utf-8"), bcrypt.gensalt()
+-    ).decode("utf-8")
+-
+-
+-def verify_password(plain_password: str, password_hash: str) -> bool:
+-    """Verify a plaintext password against a stored bcrypt hash.
+-
+-    Args:
+-        plain_password: Raw password to check.
+-        password_hash: Stored bcrypt hash from database.
+-
+-    Returns:
+-        bool: True if the password matches, False otherwise.
+-    """
+-    try:
+-        return bcrypt.checkpw(
+-            plain_password.encode("utf-8"),
+-            password_hash.encode("utf-8"),
+-        )
+-    except ValueError:
+-        return False
+-
+-
+-def verify_dummy_password(plain_password: str) -> None:
+-    """Run dummy bcrypt check when email is not found to equalize response time."""
+-    bcrypt.checkpw(
+-        plain_password.encode("utf-8"),
+-        _DUMMY_BCRYPT_HASH.encode("utf-8"),
+-    )
+-
+-
+-def validate_password_strength(password: str) -> None:
+-    """Validate that a new password meets minimum complexity rules.
+-
+-    Args:
+-        password: Candidate new password string.
+-
+-    Raises:
+-        HTTPException: 422 if password is shorter than 8 chars or lacks upper/lower/digit.
+-    """
+-    if len(password) < 8:
+-        raise HTTPException(
+-            status_code=422,
+-            detail="Password must be at least 8 characters long",
+-        )
+-    has_upper = any(c.isupper() for c in password)
+-    has_lower = any(c.islower() for c in password)
+-    has_digit = any(c.isdigit() for c in password)
+-    if not (has_upper and has_lower and has_digit):
+-        raise HTTPException(
+-            status_code=422,
+-            detail="Password must contain uppercase, lowercase, and numeric characters",
+-        )
+-
+-
+-def create_access_token(
+-    user_id: int,
+-    role: str,
+-    expires_delta: timedelta | None = None,
+-) -> str:
+-    """Create a short-lived signed JWT containing `sub`, `role`, `exp`, `iat`, `jti`.
+-
+-    Args:
+-        user_id: Database ID of the authenticated user.
+-        role: User role (`admin`, `operator`, `viewer`).
+-        expires_delta: Custom expiration duration; defaults to `JWT_EXPIRE_MINUTES`.
+-
+-    Returns:
+-        str: Encoded JWT string signed with `JWT_SECRET`.
+-    """
+-    now = datetime.now(timezone.utc)
+-    delta = (
+-        expires_delta
+-        if expires_delta is not None
+-        else timedelta(minutes=settings.jwt_expire_minutes)
+-    )
+-    payload: dict[str, Any] = {
+-        "sub": str(user_id),
+-        "role": role,
+-        "iat": now,
+-        "exp": now + delta,
+-        "jti": uuid.uuid4().hex,
+-    }
+-    return jwt.encode(
+-        payload,
+-        settings.jwt_secret,
+-        algorithm=settings.jwt_algorithm,
+-    )
+-
+-
+-def decode_access_token(token: str) -> dict[str, Any]:
+-    """Decode and validate a JWT access token.
+-
+-    Args:
+-        token: Raw Bearer JWT string.
+-
+-    Returns:
+-        dict[str, Any]: Verified JWT payload dictionary.
+-
+-    Raises:
+-        HTTPException: 401 if token is malformed, expired, revoked, or missing claims.
+-    """
+-    try:
+-        payload = jwt.decode(
+-            token,
+-            settings.jwt_secret,
+-            algorithms=[settings.jwt_algorithm],
+-            options={"require": ["sub", "role", "exp"]},
+-        )
+-    except jwt.ExpiredSignatureError as exc:
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="Token has expired",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        ) from exc
+-    except jwt.InvalidTokenError as exc:
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="Invalid authentication token",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        ) from exc
+-
+-    jti = payload.get("jti")
+-    if jti and jti in _REVOKED_JTIS:
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="Token has been revoked",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        )
+-    return payload
+-
+-
+-def revoke_token(token: str) -> None:
+-    """Revoke a JWT access token by recording its `jti` identifier."""
+-    payload = decode_access_token(token)
+-    jti = payload.get("jti")
+-    if jti:
+-        _REVOKED_JTIS.add(str(jti))
+-
+-
+-def get_current_user(
+-    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+-    db: Session = Depends(get_db),
+-) -> User:
+-    """FastAPI dependency returning the authenticated active User from Bearer JWT.
+-
+-    Args:
+-        credentials: HTTP Authorization Bearer credentials extracted by FastAPI.
+-        db: Active SQLAlchemy database session.
+-
+-    Returns:
+-        User: Authenticated SQLAlchemy User instance whose status is 'active'.
+-
+-    Raises:
+-        HTTPException: 401 if Authorization header is missing, token signature/expiry
+-            is invalid, user no longer exists, or user account status is not 'active'.
+-    """
+-    if credentials is None or credentials.scheme.lower() != "bearer" or not credentials.credentials:
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="Missing authentication token",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        )
+-
+-    payload = decode_access_token(credentials.credentials)
+-    try:
+-        user_id = int(payload["sub"])
+-    except (KeyError, TypeError, ValueError) as exc:
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="Invalid token subject",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        ) from exc
+-
+-    user = db.query(User).filter(User.id == user_id).first()
+-    if user is None:
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="User not found",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        )
+-
+-    if user.status != "active":
+-        raise HTTPException(
+-            status_code=status.HTTP_401_UNAUTHORIZED,
+-            detail="User account is locked or disabled",
+-            headers={"WWW-Authenticate": "Bearer"},
+-        )
+-
+-    return user
++"""Password hashing, JWT creation/verification, and get_current_user dependency."""
++
++from __future__ import annotations
++
++from datetime import datetime, timedelta, timezone
++from typing import Any
++import uuid
++
++import bcrypt
++from fastapi import Depends, HTTPException, status
++from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
++import jwt
++from sqlalchemy.orm import Session
++
++from app.config import settings
++from app.db import get_db, SessionLocal
++from app.models.user import User
++
++bearer_scheme = HTTPBearer(auto_error=False)
++
++# Precomputed dummy bcrypt hash to mitigate timing-based user enumeration
++_DUMMY_BCRYPT_HASH = bcrypt.hashpw(b"dummy_Timing_Defense_Secret_99!", bcrypt.gensalt(rounds=settings.bcrypt_rounds)).decode(
++    "utf-8"
++)
++
++
++
++def hash_password(plain_password: str) -> str:
++    """Hash a plaintext password using bcrypt directly.
++
++    Args:
++        plain_password: Raw password provided by the user.
++
++    Returns:
++        str: Bcrypt hash string suitable for storing in `users.password_hash`.
++    """
++    return bcrypt.hashpw(
++        plain_password.encode("utf-8"), bcrypt.gensalt(rounds=settings.bcrypt_rounds)
++    ).decode("utf-8")
++
++
++def verify_password(plain_password: str, password_hash: str) -> bool:
++    """Verify a plaintext password against a stored bcrypt hash.
++
++    Args:
++        plain_password: Raw password to check.
++        password_hash: Stored bcrypt hash from database.
++
++    Returns:
++        bool: True if the password matches, False otherwise.
++    """
++    try:
++        return bcrypt.checkpw(
++            plain_password.encode("utf-8"),
++            password_hash.encode("utf-8"),
++        )
++    except ValueError:
++        return False
++
++
++def verify_dummy_password(plain_password: str) -> None:
++    """TV3 timing defense; also handle bcrypt's 72-byte input limit."""
++    try:
++        bcrypt.checkpw(plain_password.encode("utf-8"), _DUMMY_BCRYPT_HASH.encode("utf-8"))
++    except ValueError:
++        pass
++
++
++def validate_password_strength(password: str) -> None:
++    """Keep the existing account policy; never silently truncate bcrypt input."""
++    if len(password) < settings.min_password_len or len(password.encode("utf-8")) > 72:
++        raise HTTPException(422, "Mật khẩu không đáp ứng độ dài cho phép")
++
++
++def create_access_token(
++    user_id: int,
++    role: str | None = None,
++    expires_delta: timedelta | None = None,
++    *,
++    token_version: int | None = None,
++) -> str:
++    """Create a short-lived signed JWT containing `sub`, `role`, `exp`, `iat`, `jti`.
++
++    Args:
++        user_id: Database ID of the authenticated user.
++        role: User role (`admin`, `operator`, `viewer`).
++        expires_delta: Custom expiration duration; defaults to `JWT_EXPIRE_MINUTES`.
++
++    Returns:
++        str: Encoded JWT string signed with `JWT_SECRET`.
++    """
++    if token_version is None:
++        with SessionLocal() as session:
++            user = session.get(User, user_id)
++            if user is None or user.status != "active":
++                raise HTTPException(401, "User not found or disabled")
++            token_version = user.token_version
++            role = user.role
++    now = datetime.now(timezone.utc)
++    delta = (
++        expires_delta
++        if expires_delta is not None
++        else timedelta(minutes=settings.jwt_ttl_minutes)
++    )
++    payload: dict[str, Any] = {
++        "sub": str(user_id),
++        "role": role,
++        "tv": token_version,
++        "iat": now,
++        "exp": now + delta,
++        "jti": uuid.uuid4().hex,
++    }
++    return jwt.encode(
++        payload,
++        settings.jwt_secret,
++        algorithm="HS256",
++    )
++
++
++def decode_access_token(token: str) -> dict[str, Any]:
++    """Decode and validate a JWT access token.
++
++    Args:
++        token: Raw Bearer JWT string.
++
++    Returns:
++        dict[str, Any]: Verified JWT payload dictionary.
++
++    Raises:
++        HTTPException: 401 if token is malformed, expired, revoked, or missing claims.
++    """
++    try:
++        payload = jwt.decode(
++            token,
++            settings.jwt_secret,
++            algorithms=["HS256"],
++            options={"require": ["sub", "exp", "tv"]},
++        )
++    except jwt.ExpiredSignatureError as exc:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Token has expired",
++            headers={"WWW-Authenticate": "Bearer"},
++        ) from exc
++    except jwt.InvalidTokenError as exc:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Invalid authentication token",
++            headers={"WWW-Authenticate": "Bearer"},
++        ) from exc
++
++    return payload
++
++
++def revoke_token(token: str) -> None:
++    """Persist revocation using the account version, including across restart."""
++    payload = decode_access_token(token)
++    with SessionLocal() as session:
++        user = session.get(User, int(payload["sub"]))
++        if user is None or user.token_version != payload.get("tv"):
++            raise HTTPException(401, "Token has been revoked")
++        user.token_version += 1
++        session.commit()
++
++
++def get_current_user(
++    credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
++    db: Session = Depends(get_db),
++) -> User:
++    """FastAPI dependency returning the authenticated active User from Bearer JWT.
++
++    Args:
++        credentials: HTTP Authorization Bearer credentials extracted by FastAPI.
++        db: Active SQLAlchemy database session.
++
++    Returns:
++        User: Authenticated SQLAlchemy User instance whose status is 'active'.
++
++    Raises:
++        HTTPException: 401 if Authorization header is missing, token signature/expiry
++            is invalid, user no longer exists, or user account status is not 'active'.
++    """
++    if credentials is None or credentials.scheme.lower() != "bearer" or not credentials.credentials:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Missing authentication token",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++
++    payload = decode_access_token(credentials.credentials)
++    try:
++        user_id = int(payload["sub"])
++    except (KeyError, TypeError, ValueError) as exc:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Invalid token subject",
++            headers={"WWW-Authenticate": "Bearer"},
++        ) from exc
++
++    user = db.query(User).filter(User.id == user_id).first()
++    if user is None:
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="User not found",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++
++    if user.status != "active" or user.token_version != payload.get("tv"):
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="User account is locked or disabled",
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++
++    return user
++
++
++def create_token(user_id: int, token_version: int) -> tuple[str, int]:
++    """TV2 compatibility: keep its (JWT, seconds) return contract."""
++    return create_access_token(user_id, token_version=token_version), settings.jwt_ttl_minutes * 60
++
++
++def decode_token(token: str) -> dict[str, Any]:
++    """TV2 pure decoder: websocket guards handle JWT errors themselves."""
++    return jwt.decode(token, settings.jwt_secret, algorithms=["HS256"],
++                      options={"require": ["exp", "sub"]})
++dummy_verify = verify_dummy_password
+--- TV3/WMS_TV3_Local/backend/app/security/lockout.py
++++ backend/app/security/lockout.py
+@@ -1,140 +1,52 @@
+-"""Account lockout after repeated failed logins and per-IP rate limiting (S6)."""
+-
+-from __future__ import annotations
+-
+-from collections import defaultdict, deque
+-from datetime import datetime, timedelta, timezone
+-import time
+-
+-from fastapi import HTTPException, Request, status
+-from sqlalchemy.orm import Session
+-
+-from app.models.user import User
+-
+-MAX_FAILED_ATTEMPTS: int = 5
+-LOCKOUT_DURATION_MINUTES: int = 15
+-
+-# Per-IP sliding window rate limit for /api/auth/login
+-RATE_LIMIT_MAX_REQUESTS: int = 20
+-RATE_LIMIT_WINDOW_SECONDS: float = 60.0
+-
+-_ip_request_timestamps: dict[str, deque[float]] = defaultdict(deque)
+-
+-
+-def utcnow() -> datetime:
+-    """Return current UTC datetime (monkeypatchable in tests to advance clock)."""
+-    return datetime.now(timezone.utc)
+-
+-
+-def _ensure_utc(dt: datetime) -> datetime:
+-    """Attach UTC timezone if SQLite returned a naive datetime."""
+-    if dt.tzinfo is None:
+-        return dt.replace(tzinfo=timezone.utc)
+-    return dt.astimezone(timezone.utc)
+-
+-
+-def is_user_temporarily_locked(user: User, now: datetime | None = None) -> bool:
+-    """Check whether a user account is currently within its temporary lockout window.
+-
+-    Args:
+-        user: User ORM instance to check.
+-        now: Optional reference UTC timestamp (defaults to `utcnow()`).
+-
+-    Returns:
+-        bool: True if `user.locked_until` is set and in the future, False otherwise.
+-    """
+-    if user.locked_until is None:
+-        return False
+-    current_time = _ensure_utc(now or utcnow())
+-    locked_until_utc = _ensure_utc(user.locked_until)
+-    return locked_until_utc > current_time
+-
+-
+-def record_failed_login(
+-    db: Session,
+-    user: User,
+-    now: datetime | None = None,
+-) -> bool:
+-    """Increment `failed_attempts` and set `locked_until` when reaching 5 failures.
+-
+-    Args:
+-        db: Active SQLAlchemy session.
+-        user: User ORM instance who failed authentication.
+-        now: Optional reference UTC timestamp (defaults to `utcnow()`).
+-
+-    Returns:
+-        bool: True if this failure triggered a temporary account lockout, False otherwise.
+-    """
+-    current_time = _ensure_utc(now or utcnow())
+-
+-    # If a previous lockout window has already expired, start counting fresh
+-    if user.locked_until is not None and _ensure_utc(user.locked_until) <= current_time:
+-        user.failed_attempts = 0
+-        user.locked_until = None
+-
+-    user.failed_attempts = (user.failed_attempts or 0) + 1
+-    triggered_lockout = False
+-
+-    if user.failed_attempts >= MAX_FAILED_ATTEMPTS:
+-        user.locked_until = current_time + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
+-        triggered_lockout = True
+-
+-    db.add(user)
+-    db.commit()
+-    db.refresh(user)
+-    return triggered_lockout
+-
+-
+-def reset_login_attempts(db: Session, user: User) -> None:
+-    """Reset `failed_attempts` and `locked_until` upon a successful login.
+-
+-    Args:
+-        db: Active SQLAlchemy session.
+-        user: User ORM instance who authenticated successfully.
+-    """
+-    if user.failed_attempts != 0 or user.locked_until is not None:
+-        user.failed_attempts = 0
+-        user.locked_until = None
+-        db.add(user)
+-        db.commit()
+-        db.refresh(user)
+-
+-
+-def get_client_ip(request: Request) -> str:
+-    """Extract client IP address from X-Forwarded-For header or socket peer."""
+-    forwarded = request.headers.get("x-forwarded-for")
+-    if forwarded:
+-        return forwarded.split(",")[0].strip()
+-    if request.client and request.client.host:
+-        return request.client.host
+-    return "unknown"
+-
+-
+-def check_login_rate_limit(request: Request) -> None:
+-    """Enforce sliding-window per-IP rate limiting on `/api/auth/login`.
+-
+-    Raises:
+-        HTTPException: 429 Too Many Requests if the client IP exceeds
+-            `RATE_LIMIT_MAX_REQUESTS` within `RATE_LIMIT_WINDOW_SECONDS`.
+-    """
+-    client_ip = get_client_ip(request)
+-    now_mono = time.monotonic()
+-    cutoff = now_mono - RATE_LIMIT_WINDOW_SECONDS
+-
+-    bucket = _ip_request_timestamps[client_ip]
+-    while bucket and bucket[0] <= cutoff:
+-        bucket.popleft()
+-
+-    if len(bucket) >= RATE_LIMIT_MAX_REQUESTS:
+-        raise HTTPException(
+-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+-            detail="Too many login requests from this IP. Please try again later.",
+-            headers={"Retry-After": str(int(RATE_LIMIT_WINDOW_SECONDS))},
+-        )
+-
+-    bucket.append(now_mono)
+-
+-
+-def reset_rate_limiter() -> None:
+-    """Clear in-memory IP rate limit buckets (used by automated tests)."""
+-    _ip_request_timestamps.clear()
++"""TV3 sliding-window login limit, adapted for bounded memory and trusted proxy handling."""
++from collections import OrderedDict, deque
++import ipaddress
++import threading
++from time import monotonic
++
++from fastapi import HTTPException, Request
++from ..config import settings
++
++_buckets: OrderedDict[str, deque] = OrderedDict()
++_lock = threading.Lock()
++
++
++def client_ip(request: Request) -> str:
++    peer = request.client.host if request.client else "unknown"
++    try:
++        address = ipaddress.ip_address(peer)
++        trusted = any(address in ipaddress.ip_network(c.strip(), strict=False)
++                      for c in settings.trusted_proxy_cidrs.split(",") if c.strip())
++        forwarded = request.headers.get("x-real-ip", "")
++        if trusted and forwarded:
++            return str(ipaddress.ip_address(forwarded))
++    except ValueError:
++        pass
++    return peer
++
++
++def check_login_rate_limit(request: Request) -> None:
++    if settings.login_ip_max_attempts <= 0:
++        return
++    ip, now = client_ip(request), monotonic()
++    with _lock:
++        bucket = _buckets.setdefault(ip, deque())
++        while bucket and bucket[0] <= now - settings.login_ip_window_s:
++            bucket.popleft()
++        _buckets.move_to_end(ip)
++        while len(_buckets) > 10000:
++            _buckets.popitem(last=False)
++        if len(bucket) >= settings.login_ip_max_attempts:
++            retry = max(1, int(settings.login_ip_window_s - (now - bucket[0])) + 1)
++            raise HTTPException(status_code=429, detail="Quá nhiều lần đăng nhập từ địa chỉ này, vui lòng thử lại.",
++                                headers={"Retry-After": str(retry)})
++        bucket.append(now)
++
++
++def reset_rate_limiter() -> None:
++    with _lock:
++        _buckets.clear()
++
++
++# TV3 shared interface.
++get_client_ip = client_ip
+--- TV3/WMS_TV3_Local/backend/app/security/rbac.py
++++ backend/app/security/rbac.py
+@@ -1,300 +1,302 @@
+-"""Role-Based Access Control (RBAC) and device-scope authorization (S7).
+-
+-Provides the shared authorization interfaces handed off to TV2 and TV4:
+-- `require_role(*roles)`
+-- `can_access_device(user, device_id, db=None)`
+-- `require_device_access(device_id, current_user, db)`
+-- `PERMISSION_MATRIX`: canonical 13-row permission matrix from section 1.2.
+-"""
+-
+-from __future__ import annotations
+-
+-from collections.abc import Callable
+-from dataclasses import dataclass
+-
+-from fastapi import Depends, HTTPException, Request, status
+-from sqlalchemy.orm import Session, object_session
+-
+-from app.db import SessionLocal, get_db
+-from app.models.device import Device
+-from app.models.device_stub import DeviceStub
+-from app.models.user import User, UserDevice
+-from app.security.auth import get_current_user
+-from app.security.lockout import get_client_ip
+-from app.services import audit
+-
+-
+-@dataclass(frozen=True)
+-class PermissionSpec:
+-    """Specification of a single row in the section 1.2 RBAC permission matrix."""
+-
+-    action: str
+-    description_vi: str
+-    allowed_roles: tuple[str, ...]
+-    scoped_to_assigned_device: bool
+-
+-
+-# Ma tran quyen (Muc 1.2 AGENT_PLAN_TV3.md):
+-# - allowed_roles: cac vai tro duoc phep thuc hien hanh dong
+-# - scoped_to_assigned_device: True neu Operator/Viewer chi duoc thao tac tren thiet bi duoc gan (◐)
+-PERMISSION_MATRIX: dict[str, PermissionSpec] = {
+-    "users:manage": PermissionSpec(
+-        action="users:manage",
+-        description_vi="Quản lý người dùng (tạo, khóa, đổi vai trò)",
+-        allowed_roles=("admin",),
+-        scoped_to_assigned_device=False,
+-    ),
+-    "account:self": PermissionSpec(
+-        action="account:self",
+-        description_vi="Xem/sửa tài khoản của mình, đổi mật khẩu",
+-        allowed_roles=("admin", "operator", "viewer"),
+-        scoped_to_assigned_device=False,
+-    ),
+-    "devices:lifecycle_admin": PermissionSpec(
+-        action="devices:lifecycle_admin",
+-        description_vi="Đăng ký, cấp credential, thu hồi thiết bị",
+-        allowed_roles=("admin",),
+-        scoped_to_assigned_device=False,
+-    ),
+-    "devices:assign": PermissionSpec(
+-        action="devices:assign",
+-        description_vi="Gán thiết bị cho người dùng và khu vực",
+-        allowed_roles=("admin",),
+-        scoped_to_assigned_device=False,
+-    ),
+-    "devices:view": PermissionSpec(
+-        action="devices:view",
+-        description_vi="Xem danh sách và trạng thái thiết bị",
+-        allowed_roles=("admin", "operator", "viewer"),
+-        scoped_to_assigned_device=True,
+-    ),
+-    "telemetry:view": PermissionSpec(
+-        action="telemetry:view",
+-        description_vi="Xem dữ liệu hiện tại, lịch sử, biểu đồ",
+-        allowed_roles=("admin", "operator", "viewer"),
+-        scoped_to_assigned_device=True,
+-    ),
+-    "telemetry:export_csv": PermissionSpec(
+-        action="telemetry:export_csv",
+-        description_vi="Xuất dữ liệu CSV",
+-        allowed_roles=("admin", "operator"),
+-        scoped_to_assigned_device=True,
+-    ),
+-    "devices:update_config": PermissionSpec(
+-        action="devices:update_config",
+-        description_vi="Đổi cấu hình và ngưỡng cảnh báo",
+-        allowed_roles=("admin", "operator"),
+-        scoped_to_assigned_device=True,
+-    ),
+-    "devices:send_command": PermissionSpec(
+-        action="devices:send_command",
+-        description_vi="Gửi lệnh bật/tắt bơm",
+-        allowed_roles=("admin", "operator"),
+-        scoped_to_assigned_device=True,
+-    ),
+-    "devices:set_maintenance": PermissionSpec(
+-        action="devices:set_maintenance",
+-        description_vi="Chuyển thiết bị sang Maintenance",
+-        allowed_roles=("admin", "operator"),
+-        scoped_to_assigned_device=True,
+-    ),
+-    "alerts:view": PermissionSpec(
+-        action="alerts:view",
+-        description_vi="Xem cảnh báo",
+-        allowed_roles=("admin", "operator", "viewer"),
+-        scoped_to_assigned_device=True,
+-    ),
+-    "alerts:ack_close": PermissionSpec(
+-        action="alerts:ack_close",
+-        description_vi="Xác nhận (ack) và đóng cảnh báo",
+-        allowed_roles=("admin", "operator"),
+-        scoped_to_assigned_device=True,
+-    ),
+-    "audit_logs:view": PermissionSpec(
+-        action="audit_logs:view",
+-        description_vi="Xem audit log",
+-        allowed_roles=("admin",),
+-        scoped_to_assigned_device=False,
+-    ),
+-}
+-
+-
+-def require_role(*roles: str) -> Callable[..., User]:
+-    """Create a FastAPI dependency that restricts access to the specified roles.
+-
+-    Args:
+-        *roles: One or more role names allowed to access the endpoint
+-            (e.g. `'admin'`, `'operator'`, `'viewer'`).
+-
+-    Returns:
+-        Callable[..., User]: FastAPI dependency returning the authenticated `User`
+-            if their role is in `roles`.
+-
+-    Raises:
+-        HTTPException: 401 if unauthenticated; 403 if the user's role is not in `roles`.
+-    """
+-    allowed = {r.lower() for r in roles}
+-
+-    def _role_dependency(
+-        request: Request,
+-        current_user: User = Depends(get_current_user),
+-        db: Session = Depends(get_db),
+-    ) -> User:
+-        if (current_user.role or "").lower() not in allowed:
+-            audit.log(
+-                db=db,
+-                user=current_user,
+-                action="PERMISSION_DENIED",
+-                target_type="endpoint",
+-                target_id=f"{request.method} {request.url.path}",
+-                ip=get_client_ip(request),
+-                detail=f"Role '{current_user.role}' not in allowed roles {sorted(allowed)}",
+-            )
+-            raise HTTPException(
+-                status_code=status.HTTP_403_FORBIDDEN,
+-                detail="Insufficient role permissions",
+-            )
+-        return current_user
+-
+-    return _role_dependency
+-
+-
+-def can_access_device(
+-    user: User,
+-    device_id: int,
+-    db: Session | None = None,
+-) -> bool:
+-    """Check whether `user` is permitted to access `device_id`.
+-
+-    Admin users can access all devices. Operator and Viewer users can only access
+-    devices explicitly assigned to them in the `user_devices` table.
+-
+-    Args:
+-        user: Authenticated `User` ORM instance.
+-        device_id: Primary key ID of the target device.
+-        db: Optional SQLAlchemy session. If omitted, uses `object_session(user)`
+-            or opens a temporary session from `SessionLocal`.
+-
+-    Returns:
+-        bool: True if the user is allowed to access the device, False otherwise.
+-    """
+-    if user is None or user.status != "active":
+-        return False
+-
+-    if (user.role or "").lower() == "admin":
+-        return True
+-
+-    session = db or object_session(user)
+-    close_after = False
+-    if session is None:
+-        session = SessionLocal()
+-        close_after = True
+-
+-    try:
+-        assignment = (
+-            session.query(UserDevice)
+-            .filter(
+-                UserDevice.user_id == user.id,
+-                UserDevice.device_id == device_id,
+-            )
+-            .first()
+-        )
+-        return assignment is not None
+-    finally:
+-        if close_after:
+-            session.close()
+-
+-
+-def can_access_site(
+-    user: User,
+-    site_id: int,
+-    db: Session | None = None,
+-) -> bool:
+-    """Check whether `user` is permitted to access `site_id` (2-node site scope).
+-
+-    Admin users can access all sites. Operator and Viewer users can access a site
+-    if they are assigned to at least one device (tank or pipe node) in that site.
+-
+-    Args:
+-        user: Authenticated `User` ORM instance.
+-        site_id: Primary key ID of the target site.
+-        db: Optional SQLAlchemy session.
+-
+-    Returns:
+-        bool: True if the user is allowed to access the site, False otherwise.
+-    """
+-    if user is None or user.status != "active":
+-        return False
+-
+-    if (user.role or "").lower() == "admin":
+-        return True
+-
+-    session = db or object_session(user)
+-    close_after = False
+-    if session is None:
+-        session = SessionLocal()
+-        close_after = True
+-
+-    try:
+-        assignment = (
+-            session.query(UserDevice)
+-            .join(Device, Device.id == UserDevice.device_id)
+-            .filter(
+-                UserDevice.user_id == user.id,
+-                Device.site_id == site_id,
+-            )
+-            .first()
+-        )
+-        return assignment is not None
+-    finally:
+-        if close_after:
+-            session.close()
+-
+-
+-def require_device_access(
+-    device_id: int,
+-    request: Request,
+-    current_user: User = Depends(get_current_user),
+-    db: Session = Depends(get_db),
+-) -> User:
+-    """FastAPI dependency verifying the user can access `device_id` in path/query.
+-
+-    Returns 404 (not 403) when a device is outside the user's assigned scope so
+-    that the API does not leak whether an unassigned device ID exists.
+-
+-    Args:
+-        device_id: Target device ID extracted from path or query parameters.
+-        request: Active HTTP request (used to record client IP in audit logs).
+-        current_user: Authenticated `User` resolved by `get_current_user`.
+-        db: Active SQLAlchemy database session.
+-
+-    Returns:
+-        User: Authenticated `User` if access to `device_id` is permitted.
+-
+-    Raises:
+-        HTTPException: 401 if unauthenticated; 404 if the device does not exist
+-            or is outside the user's assigned scope in `user_devices`.
+-    """
+-    if not can_access_device(current_user, device_id, db=db):
+-        audit.log(
+-            db=db,
+-            user=current_user,
+-            action="PERMISSION_DENIED",
+-            target_type="device",
+-            target_id=str(device_id),
+-            ip=get_client_ip(request),
+-            detail=f"Out-of-scope device access attempt on {request.method} {request.url.path}",
+-        )
+-        raise HTTPException(
+-            status_code=status.HTTP_404_NOT_FOUND,
+-            detail="Device not found",
+-        )
+-
+-    device = db.query(DeviceStub).filter(DeviceStub.id == device_id).first()
+-    if device is None:
+-        raise HTTPException(
+-            status_code=status.HTTP_404_NOT_FOUND,
+-            detail="Device not found",
+-        )
+-
+-    return current_user
++"""Role-Based Access Control (RBAC) and device-scope authorization (S7).
++
++Provides the shared authorization interfaces handed off to TV2 and TV4:
++- `require_role(*roles)`
++- `can_access_device(user, device_id, db=None)`
++- `require_device_access(device_id, current_user, db)`
++- `PERMISSION_MATRIX`: canonical 13-row permission matrix from section 1.2.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++from dataclasses import dataclass
++
++from fastapi import Depends, HTTPException, Request, status
++from sqlalchemy.orm import Session, object_session
++
++from app.db import SessionLocal, get_db
++from app.models.device import Device
++from app.models.user import User, UserDevice
++from app.security.auth import get_current_user
++from app.security.lockout import get_client_ip
++from app.services import audit
++
++
++@dataclass(frozen=True)
++class PermissionSpec:
++    """Specification of a single row in the section 1.2 RBAC permission matrix."""
++
++    action: str
++    description_vi: str
++    allowed_roles: tuple[str, ...]
++    scoped_to_assigned_device: bool
++
++
++# Ma tran quyen (Muc 1.2 AGENT_PLAN_TV3.md):
++# - allowed_roles: cac vai tro duoc phep thuc hien hanh dong
++# - scoped_to_assigned_device: True neu Operator/Viewer chi duoc thao tac tren thiet bi duoc gan (◐)
++PERMISSION_MATRIX: dict[str, PermissionSpec] = {
++    "users:manage": PermissionSpec(
++        action="users:manage",
++        description_vi="Quản lý người dùng (tạo, khóa, đổi vai trò)",
++        allowed_roles=("admin",),
++        scoped_to_assigned_device=False,
++    ),
++    "account:self": PermissionSpec(
++        action="account:self",
++        description_vi="Xem/sửa tài khoản của mình, đổi mật khẩu",
++        allowed_roles=("admin", "operator", "viewer"),
++        scoped_to_assigned_device=False,
++    ),
++    "devices:lifecycle_admin": PermissionSpec(
++        action="devices:lifecycle_admin",
++        description_vi="Đăng ký, cấp credential, thu hồi thiết bị",
++        allowed_roles=("admin",),
++        scoped_to_assigned_device=False,
++    ),
++    "devices:assign": PermissionSpec(
++        action="devices:assign",
++        description_vi="Gán thiết bị cho người dùng và khu vực",
++        allowed_roles=("admin",),
++        scoped_to_assigned_device=False,
++    ),
++    "devices:view": PermissionSpec(
++        action="devices:view",
++        description_vi="Xem danh sách và trạng thái thiết bị",
++        allowed_roles=("admin", "operator", "viewer"),
++        scoped_to_assigned_device=True,
++    ),
++    "telemetry:view": PermissionSpec(
++        action="telemetry:view",
++        description_vi="Xem dữ liệu hiện tại, lịch sử, biểu đồ",
++        allowed_roles=("admin", "operator", "viewer"),
++        scoped_to_assigned_device=True,
++    ),
++    "telemetry:export_csv": PermissionSpec(
++        action="telemetry:export_csv",
++        description_vi="Xuất dữ liệu CSV",
++        allowed_roles=("admin", "operator"),
++        scoped_to_assigned_device=True,
++    ),
++    "devices:update_config": PermissionSpec(
++        action="devices:update_config",
++        description_vi="Đổi cấu hình và ngưỡng cảnh báo",
++        allowed_roles=("admin", "operator"),
++        scoped_to_assigned_device=True,
++    ),
++    "devices:send_command": PermissionSpec(
++        action="devices:send_command",
++        description_vi="Gửi lệnh bật/tắt bơm",
++        allowed_roles=("admin", "operator"),
++        scoped_to_assigned_device=True,
++    ),
++    "devices:set_maintenance": PermissionSpec(
++        action="devices:set_maintenance",
++        description_vi="Chuyển thiết bị sang Maintenance",
++        allowed_roles=("admin", "operator"),
++        scoped_to_assigned_device=True,
++    ),
++    "alerts:view": PermissionSpec(
++        action="alerts:view",
++        description_vi="Xem cảnh báo",
++        allowed_roles=("admin", "operator", "viewer"),
++        scoped_to_assigned_device=True,
++    ),
++    "alerts:ack_close": PermissionSpec(
++        action="alerts:ack_close",
++        description_vi="Xác nhận (ack) và đóng cảnh báo",
++        allowed_roles=("admin", "operator"),
++        scoped_to_assigned_device=True,
++    ),
++    "audit_logs:view": PermissionSpec(
++        action="audit_logs:view",
++        description_vi="Xem audit log",
++        allowed_roles=("admin",),
++        scoped_to_assigned_device=False,
++    ),
++}
++
++
++def require_role(*roles: str) -> Callable[..., User]:
++    """Create a FastAPI dependency that restricts access to the specified roles.
++
++    Args:
++        *roles: One or more role names allowed to access the endpoint
++            (e.g. `'admin'`, `'operator'`, `'viewer'`).
++
++    Returns:
++        Callable[..., User]: FastAPI dependency returning the authenticated `User`
++            if their role is in `roles`.
++
++    Raises:
++        HTTPException: 401 if unauthenticated; 403 if the user's role is not in `roles`.
++    """
++    allowed = {r.lower() for r in roles}
++
++    def _role_dependency(
++        request: Request,
++        current_user: User = Depends(get_current_user),
++        db: Session = Depends(get_db),
++    ) -> User:
++        if (current_user.role or "").lower() not in allowed:
++            audit.log(
++                db=db,
++                user=current_user,
++                action="PERMISSION_DENIED",
++                target_type="endpoint",
++                target_id=f"{request.method} {request.url.path}",
++                ip=get_client_ip(request),
++                detail=f"Role '{current_user.role}' not in allowed roles {sorted(allowed)}",
++            )
++            db.commit()
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail="Insufficient role permissions",
++            )
++        return current_user
++
++    return _role_dependency
++
++
++def can_access_device(
++    user: User,
++    device_id: int,
++    db: Session | None = None,
++) -> bool:
++    """Check whether `user` is permitted to access `device_id`.
++
++    Admin users can access all devices. Operator and Viewer users can only access
++    devices explicitly assigned to them in the `user_devices` table.
++
++    Args:
++        user: Authenticated `User` ORM instance.
++        device_id: Primary key ID of the target device.
++        db: Optional SQLAlchemy session. If omitted, uses `object_session(user)`
++            or opens a temporary session from `SessionLocal`.
++
++    Returns:
++        bool: True if the user is allowed to access the device, False otherwise.
++    """
++    if user is None or user.status != "active":
++        return False
++
++    if (user.role or "").lower() == "admin":
++        return True
++
++    session = db or object_session(user)
++    close_after = False
++    if session is None:
++        session = SessionLocal()
++        close_after = True
++
++    try:
++        assignment = (
++            session.query(UserDevice)
++            .filter(
++                UserDevice.user_id == user.id,
++                UserDevice.device_id == device_id,
++            )
++            .first()
++        )
++        return assignment is not None
++    finally:
++        if close_after:
++            session.close()
++
++
++def can_access_site(
++    user: User,
++    site_id: int,
++    db: Session | None = None,
++) -> bool:
++    """Check whether `user` is permitted to access `site_id` (2-node site scope).
++
++    Admin users can access all sites. Operator and Viewer users can access a site
++    if they are assigned to at least one device (tank or pipe node) in that site.
++
++    Args:
++        user: Authenticated `User` ORM instance.
++        site_id: Primary key ID of the target site.
++        db: Optional SQLAlchemy session.
++
++    Returns:
++        bool: True if the user is allowed to access the site, False otherwise.
++    """
++    if user is None or user.status != "active":
++        return False
++
++    if (user.role or "").lower() == "admin":
++        return True
++
++    session = db or object_session(user)
++    close_after = False
++    if session is None:
++        session = SessionLocal()
++        close_after = True
++
++    try:
++        assignment = (
++            session.query(UserDevice)
++            .join(Device, Device.id == UserDevice.device_id)
++            .filter(
++                UserDevice.user_id == user.id,
++                Device.site_id == site_id,
++            )
++            .first()
++        )
++        return assignment is not None
++    finally:
++        if close_after:
++            session.close()
++
++
++def require_device_access(
++    device_id: int,
++    request: Request,
++    current_user: User = Depends(get_current_user),
++    db: Session = Depends(get_db),
++) -> User:
++    """FastAPI dependency verifying the user can access `device_id` in path/query.
++
++    Returns 404 (not 403) when a device is outside the user's assigned scope so
++    that the API does not leak whether an unassigned device ID exists.
++
++    Args:
++        device_id: Target device ID extracted from path or query parameters.
++        request: Active HTTP request (used to record client IP in audit logs).
++        current_user: Authenticated `User` resolved by `get_current_user`.
++        db: Active SQLAlchemy database session.
++
++    Returns:
++        User: Authenticated `User` if access to `device_id` is permitted.
++
++    Raises:
++        HTTPException: 401 if unauthenticated; 404 if the device does not exist
++            or is outside the user's assigned scope in `user_devices`.
++    """
++    if not can_access_device(current_user, device_id, db=db):
++        audit.log(
++            db=db,
++            user=current_user,
++            action="PERMISSION_DENIED",
++            target_type="device",
++            target_id=str(device_id),
++            ip=get_client_ip(request),
++            detail=f"Out-of-scope device access attempt on {request.method} {request.url.path}",
++        )
++        db.commit()
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail="Device not found",
++        )
++
++    device = db.query(Device).filter(Device.id == device_id).first()
++    if device is None:
++        db.commit()
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail="Device not found",
++        )
++
++    return current_user
+--- TV3/WMS_TV3_Local/backend/app/services/__init__.py
++++ backend/app/services/__init__.py
+@@ -1,5 +1 @@
+-"""Backend domain and infrastructure services."""
+-
+-from app.services import audit, broker_admin
+-
+-__all__ = ["audit", "broker_admin"]
++"""Shared services from the TV2 + TV3 integration."""
+--- TV3/WMS_TV3_Local/backend/app/services/audit.py
++++ backend/app/services/audit.py
+@@ -1,93 +1,97 @@
+-"""Audit logging service (`audit.log`) shared between TV3 and TV2 (S9)."""
+-
+-from __future__ import annotations
+-
+-import json
+-import re
+-from typing import Any
+-
+-from sqlalchemy.orm import Session
+-
+-from app.models.audit_log import AuditLog
+-from app.models.user import User
+-
+-_SENSITIVE_KEY_PATTERN = re.compile(
+-    r"(password|passwd|secret|token|jwt|authorization|credential)",
+-    re.IGNORECASE,
+-)
+-
+-
+-def _sanitize_detail(detail: str | dict[str, Any] | None) -> str | None:
+-    """Sanitize `detail` so passwords, tokens, or secrets are never stored."""
+-    if detail is None:
+-        return None
+-    if isinstance(detail, dict):
+-        cleaned: dict[str, Any] = {}
+-        for k, v in detail.items():
+-            if _SENSITIVE_KEY_PATTERN.search(str(k)):
+-                cleaned[str(k)] = "[REDACTED]"
+-            else:
+-                cleaned[str(k)] = v
+-        return json.dumps(cleaned, ensure_ascii=False)
+-
+-    text = str(detail)
+-    # Redact any accidental key=value or JSON fields with sensitive names
+-    text = re.sub(
+-        r'("?(?:password|old_password|new_password|token|access_token|secret)"?\s*[:=]\s*)("[^"]*"|\S+)',
+-        r'\1"[REDACTED]"',
+-        text,
+-        flags=re.IGNORECASE,
+-    )
+-    return text
+-
+-
+-def log(
+-    db: Session,
+-    user: User | int | None,
+-    action: str,
+-    target_type: str | None = None,
+-    target_id: str | int | None = None,
+-    ip: str | None = None,
+-    detail: str | dict[str, Any] | None = None,
+-) -> AuditLog:
+-    """Record a security or operational event in the `audit_logs` table.
+-
+-    Shared interface function handed off to TV2 (for pump commands, config
+-    updates, device provisioning/revocation) and used across TV3 modules.
+-    Automatically scrubs sensitive keys (`password`, `token`, `secret`) from `detail`.
+-
+-    Args:
+-        db: Active SQLAlchemy database session.
+-        user: Authenticated `User` ORM instance, user ID (`int`), or `None`
+-            (e.g. failed login for unknown account).
+-        action: Short uppercase action code (e.g. `'LOGIN_SUCCESS'`, `'SEND_COMMAND'`).
+-        target_type: Resource type affected (e.g. `'user'`, `'device'`, `'endpoint'`).
+-        target_id: Identifier of the target resource (converted to `str` if provided).
+-        ip: Client IPv4/IPv6 address string.
+-        detail: Optional human-readable string or JSON-serializable dict with non-sensitive context.
+-
+-    Returns:
+-        AuditLog: Persisted `AuditLog` ORM record.
+-
+-    Raises:
+-        SQLAlchemyError: If the database write fails.
+-    """
+-    if isinstance(user, User):
+-        resolved_user_id: int | None = user.id
+-    elif isinstance(user, int):
+-        resolved_user_id = user
+-    else:
+-        resolved_user_id = None
+-
+-    entry = AuditLog(
+-        user_id=resolved_user_id,
+-        action=action,
+-        target_type=target_type,
+-        target_id=str(target_id) if target_id is not None else None,
+-        ip=ip,
+-        detail=_sanitize_detail(detail),
+-    )
+-    db.add(entry)
+-    db.commit()
+-    db.refresh(entry)
+-    return entry
++import json
++import re
++from typing import Any
++
++from sqlalchemy.orm import Session
++
++from ..models import AuditLog, User
++
++
++# Based on TV3 services.audit; recursive and transactional in this integration.
++_SENSITIVE = re.compile(r"password|passwd|secret|token|jwt|authorization|credential", re.I)
++_TEXT_SECRET = re.compile(
++    r'''((?:["']?)(?:[\w.-]*(?:password|passwd|secret|token|jwt|authorization|credential)[\w.-]*)(?:["']?)\s*[:=]\s*)(?:"[^"\n]*"|'[^'\n]*'|Bearer\s+[^\s,;}]+|[^\s,;}]+)''',
++    re.I,
++)
++
++
++def sanitize_detail(detail: Any) -> str:
++    def clean(value, depth=0):
++        if depth > 12:
++            return "[TRUNCATED]"
++        if isinstance(value, dict):
++            return {str(k): "[REDACTED]" if _SENSITIVE.search(str(k)) else clean(v, depth + 1)
++                    for k, v in value.items()}
++        if isinstance(value, (list, tuple)):
++            return [clean(v, depth + 1) for v in value]
++        if isinstance(value, str):
++            return re.sub(r"\bBearer\s+[A-Za-z0-9._~+/-]+=*", "Bearer [REDACTED]",
++                          _TEXT_SECRET.sub(r'\1"[REDACTED]"', value), flags=re.I)
++        return value
++    if isinstance(detail, str):
++        try:
++            detail = json.loads(detail)
++        except (ValueError, TypeError):
++            return clean(detail)
++    result = clean(detail)
++    return result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
++
++
++
++
++def log(
++    db: Session,
++    user: User | int | None,
++    action: str,
++    target_type: str | None = None,
++    target_id: str | int | None = None,
++    ip: str | None = None,
++    detail: str | dict[str, Any] | None = None,
++) -> AuditLog:
++    """Record a security or operational event in the `audit_logs` table.
++
++    Shared interface function handed off to TV2 (for pump commands, config
++    updates, device provisioning/revocation) and used across TV3 modules.
++    Does not commit the caller's transaction. Automatically scrubs sensitive keys (`password`, `token`, `secret`) from `detail`.
++
++    Args:
++        db: Active SQLAlchemy database session.
++        user: Authenticated `User` ORM instance, user ID (`int`), or `None`
++            (e.g. failed login for unknown account).
++        action: Short uppercase action code (e.g. `'LOGIN_SUCCESS'`, `'SEND_COMMAND'`).
++        target_type: Resource type affected (e.g. `'user'`, `'device'`, `'endpoint'`).
++        target_id: Identifier of the target resource (converted to `str` if provided).
++        ip: Client IPv4/IPv6 address string.
++        detail: Optional human-readable string or JSON-serializable dict with non-sensitive context.
++
++    Returns:
++        AuditLog: Pending `AuditLog` ORM record; caller owns commit/rollback.
++
++    Raises:
++        SQLAlchemyError: If the database write fails.
++    """
++    if isinstance(user, User):
++        resolved_user_id: int | None = user.id
++    elif isinstance(user, int):
++        resolved_user_id = user
++    else:
++        resolved_user_id = None
++
++    entry = AuditLog(
++        user_id=resolved_user_id,
++        action=action,
++        target_type=target_type or "",
++        target_id=str(target_id) if target_id is not None else "",
++        ip=(ip or "")[:45],
++        detail=sanitize_detail(detail)[:512],
++    )
++    db.add(entry)
++    return entry
++
++def write_audit(s: Session, user_id: int | None, action: str, target_type: str,
++                target_id: int | str, ip: str, detail: str = "") -> None:
++    """TV2 API delegates to the TV3 service without a second transaction."""
++    log(s, user_id, action, target_type, target_id, ip, detail)
++
++
++_sanitize_detail = sanitize_detail
