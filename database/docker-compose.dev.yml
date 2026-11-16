@@ -1,0 +1,33 @@
+# MySQL 8 cho phát triển. TV3 gộp phần này vào deployment/docker-compose.yml.
+#   cp database/.env.example database/.env   (điền mật khẩu)
+#   docker compose --env-file database/.env -f database/docker-compose.dev.yml up -d
+# Lần đầu (volume trống) MySQL tự chạy migrations/*.sql rồi thu hẹp quyền tài khoản ứng dụng.
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: wms-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?đặt trong database/.env}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-wms}
+      MYSQL_USER: ${MYSQL_USER:-wms}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?đặt trong database/.env}
+      TZ: UTC
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      - --default-time-zone=+00:00
+      - --event-scheduler=ON
+    ports:
+      - "127.0.0.1:3306:3306"       # chỉ máy local; không mở ra ngoài
+    volumes:
+      - wms_mysql_data:/var/lib/mysql
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  wms_mysql_data:

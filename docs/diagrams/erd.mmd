@@ -1,0 +1,124 @@
+erDiagram
+  SITES {
+    int id PK
+    string name
+    string description
+  }
+  USERS {
+    int id PK
+    string email
+    string password_hash
+    string full_name
+    string role
+    string status
+    int failed_attempts
+    datetime locked_until
+    int token_version
+    datetime created_at
+  }
+  USERS ||--o{ AUDIT_LOGS : "user_id"
+  AUDIT_LOGS {
+    int id PK
+    int user_id FK
+    string action
+    string target_type
+    string target_id
+    string ip
+    string detail
+    datetime created_at
+  }
+  SITES ||--o{ DEVICES : "site_id"
+  DEVICES {
+    int id PK
+    string device_code
+    string name
+    string type
+    int site_id FK
+    string state
+    string hw_version
+    string fw_version
+    int config_applied_version
+    boolean online
+    datetime last_seen
+    datetime created_at
+  }
+  DEVICES ||--o{ ALERT_RULES : "device_id"
+  ALERT_RULES {
+    int id PK
+    int device_id FK
+    string type
+    string params_json
+    string severity
+    boolean enabled
+  }
+  DEVICES ||--o{ COMMANDS : "device_id"
+  USERS ||--o{ COMMANDS : "user_id"
+  COMMANDS {
+    int id PK
+    string cmd_id
+    int device_id FK
+    int user_id FK
+    string action
+    string params_json
+    string status
+    datetime sent_at
+    datetime acked_at
+    string reason
+  }
+  USERS ||--o{ DEVICE_CONFIGS : "updated_by"
+  DEVICES ||--o{ DEVICE_CONFIGS : "device_id"
+  DEVICE_CONFIGS {
+    int id PK
+    int device_id FK
+    string key
+    string value
+    int version
+    int updated_by FK
+    datetime updated_at
+  }
+  DEVICES ||--o| DEVICE_CREDENTIALS : "device_id"
+  DEVICE_CREDENTIALS {
+    int id PK
+    int device_id FK
+    string mqtt_username
+    string secret_hash
+    datetime created_at
+    datetime revoked_at
+  }
+  DEVICES ||--o{ TELEMETRY : "device_id"
+  TELEMETRY {
+    int id PK
+    int device_id FK
+    string boot_id
+    int seq
+    datetime ts
+    datetime received_at
+    float distance_cm
+    float level_pct
+    float flow_lpm
+    float flow_total_l
+    boolean pump_on
+    int rssi
+  }
+  USERS ||--o{ USER_DEVICES : "user_id"
+  DEVICES ||--o{ USER_DEVICES : "device_id"
+  USER_DEVICES {
+    int user_id PK
+    int device_id PK
+  }
+  ALERT_RULES ||--o{ ALERTS : "rule_id"
+  DEVICES ||--o{ ALERTS : "device_id"
+  USERS ||--o{ ALERTS : "acked_by"
+  ALERTS {
+    int id PK
+    int device_id FK
+    int rule_id FK
+    string type
+    string severity
+    float value
+    string state
+    datetime opened_at
+    int acked_by FK
+    datetime acked_at
+    datetime closed_at
+  }
