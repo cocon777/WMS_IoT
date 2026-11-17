@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Mô phỏng lắp mạch 2 node trên breadboard</title>
+<style>
+:root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
+--bg:#eceee8;--fg:#1d2420;--mut:#5a665f;--card:#fbfbf8;--line:#cfd4c9;--board:#e4e2da;--hole:#8d8a7e;--mod:#d5e3dc;--modl:#2b5d4b;--acc:#1f6f5a;--accfg:#fff}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#141816;--fg:#e6ebe7;--mut:#9aa69f;--card:#1d2420;--line:#34403a;--board:#3a3a35;--hole:#15150f;--mod:#27403a;--modl:#9fd3bf;--acc:#4fb596;--accfg:#06241b}}
+:root[data-theme="dark"]{--bg:#141816;--fg:#e6ebe7;--mut:#9aa69f;--card:#1d2420;--line:#34403a;--board:#3a3a35;--hole:#15150f;--mod:#27403a;--modl:#9fd3bf;--acc:#4fb596;--accfg:#06241b}
+html{color-scheme:light dark}*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,"Segoe UI",Roboto,sans-serif}
+main{max-width:1040px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:1.4rem;margin:0 0 4px}.sub{color:var(--mut);margin:0 0 14px}
+.box{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px;overflow-x:auto}
+svg{display:block;min-width:760px;width:100%;height:auto}
+svg text{font-family:inherit;fill:var(--fg);font-size:11px}
+.nav{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+button{font:inherit;border:1px solid var(--line);background:var(--card);color:var(--fg);padding:7px 13px;border-radius:8px;cursor:pointer}
+button:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+button.on{background:var(--acc);color:var(--accfg);border-color:var(--acc);font-weight:600}
+button:disabled{opacity:.45;cursor:default}
+.info{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:760px){.info{grid-template-columns:1fr}}
+section{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px}
+h2{font-size:1rem;margin:0 0 6px}ul{margin:0;padding-left:18px}li{margin:3px 0}
+.sw{display:inline-block;width:11px;height:11px;border-radius:50%;margin-right:6px;border:1px solid var(--line)}
+.note{color:var(--mut);font-size:.85rem;margin-top:14px;max-width:80ch}
+</style>
+</head>
+<body>
+<main>
+<h1>Lắp mạch 2 node, không cần hàn</h1>
+<p class="sub">Node ống (ESP32, lưu lượng, relay, bơm) trên breadboard 830 lỗ. Node bồn (ESP32, siêu âm) trên breadboard mini 400 lỗ. Bấm từng bước để xem dây nào cắm vào đâu.</p>
+<div class="box"><svg id="s" viewBox="0 0 980 760" role="img" aria-label="Sơ đồ lắp hai node"></svg></div>
+<div class="nav" id="nav"></div>
+<div class="info"><section><h2 id="t"></h2><p id="d" style="margin:0"></p></section><section><h2>Dây và linh kiện của bước này</h2><ul id="l"></ul></section></div>
+<p class="note">Mỗi ESP32 cấp USB riêng và có deviceId, mật khẩu riêng. Hai node không nối chung dây tín hiệu hay nguồn với nhau. ESP32 trong hình đặt cạnh breadboard và nối bằng dây Dupont, các chân vẽ theo nhãn board bạn mua (VIN, GND, D27, D26 ở hàng trái; D5, D18 ở hàng phải), hãy đối chiếu nhãn in trên board. Vị trí cột chỉ là gợi ý.</p>
+</main>
+<script>
+const NS="http://www.w3.org/2000/svg",svg=document.getElementById("s");
+const R="#d94a3d",K="#2b2b2b",G="#3f9b4a",B="#3a7bd5",Y="#d9a300",P="#8e5bd6",O="#e8772e";
+const steps=[
+["Bố trí 2 node","Node ống dùng breadboard 830 lỗ: ESP32, cảm biến lưu lượng, relay và mạch bơm. Node bồn dùng breadboard mini 400 lỗ: ESP32 thứ hai và cảm biến siêu âm HC-SR04. Mỗi ESP32 cấp USB riêng, mỗi node có deviceId riêng."],
+["Node ống: nguồn ray trên","VIN và GND của ESP32 ống nối lên ray + và ray − phía trên breadboard 830 lỗ. Cấp USB cho ESP32 này."],
+["Node ống: cảm biến lưu lượng","Dây đỏ và đen vào ray trên. Dây vàng (tín hiệu 5V) vào cột 8, qua điện trở 10k tới cột 12, rồi cột 12 qua điện trở 20k xuống ray −. D27 lấy từ cột 12 nên chỉ còn khoảng 3,3V."],
+["Node ống: relay","VCC và GND vào ray trên. Chân IN nối thẳng D26. Tới đây ESP32 đã điều khiển được cuộn relay, chưa có bơm."],
+["Node ống: nguồn riêng cho bơm","Adapter 5V 2A cắm vào jack DC ra cực vít. Cực dương nối COM của relay bằng dây 0,5 mm². Mạch bơm không đi qua breadboard."],
+["Node ống: mạch bơm qua relay","NO của relay nối dây đỏ của bơm. Dây đen của bơm nối cực âm của jack. Ống hút thả vào âu nguồn, ống đẩy đi qua cảm biến lưu lượng vào âu nhận. Dây bơm cách ESP32 ít nhất 20 cm."],
+["Node bồn: nguồn","ESP32 thứ hai cấp USB riêng. VIN và GND nối lên ray + và ray − của breadboard mini."],
+["Node bồn: siêu âm và chia áp","VCC và GND vào ray. TRIG nối D5. ECHO ra 5V nên vào cột 14, qua điện trở 10k tới cột 18, rồi cột 18 qua điện trở 20k xuống ray −. D18 lấy từ cột 18. Gắn cảm biến cách mặt nước âu nhận khoảng 10 đến 15 cm, hướng thẳng xuống."],
+["Kiểm tra trước khi cấp điện","Đo tại D27 (node ống) và D18 (node bồn) thấy khoảng 3,3V khi cảm biến chạy. Hai node không chung dây. Mạch bơm chỉ đi qua cực vít, không chạm breadboard. Nạp firmware với NODE_ROLE khác nhau và deviceId khác nhau cho từng node."]];
+const parts=[[20,170,160,190,"ESP32 ống","VIN, D27, D26"],[330,30,120,70,"Lưu lượng YF-S401","đỏ, đen, vàng"],[700,30,200,80,"Module relay 5V","VCC GND IN | COM NO"],[190,420,110,60,"Adapter 5V","2A"],[330,420,130,60,"Jack DC","ra cực vít"],[770,420,110,60,"Bơm DC280","tự mồi 3-6V"],[20,560,160,170,"ESP32 bồn","VIN, D5, D18"],[760,590,140,110,"HC-SR04","siêu âm 5V"]];
+const W=[
+[2,180,205,350,202,R,"Đỏ: ESP32 ống VIN → ray + trên",1],[2,180,230,360,212,K,"Đen: ESP32 ống GND → ray − trên",1],
+[3,350,125,370,202,R,"Lưu lượng dây đỏ → ray + trên"],[3,375,125,390,212,K,"Lưu lượng dây đen → ray − trên"],[3,400,125,390,232,Y,"Lưu lượng dây vàng → cột 8, hàng a"],[3,180,312,430,272,P,"D27 ← cột 12, hàng e (giữa 10k và 20k)",1],
+[4,720,110,730,202,R,"Relay VCC → ray + trên"],[4,742,110,750,212,K,"Relay GND → ray − trên"],[4,180,337,764,110,O,"D26 → relay IN",1],
+[5,360,420,840,110,R,"Jack DC (+) → relay COM (cực vít, dây 0,5 mm²)"],
+[6,862,110,790,420,O,"Relay NO → dây đỏ của bơm (cực vít)"],[6,390,476,850,476,K,"Jack DC (−) → dây đen của bơm"],
+[7,180,600,410,568,R,"Đỏ: ESP32 bồn VIN → ray + mini",1],[7,180,625,420,578,K,"Đen: ESP32 bồn GND → ray − mini",1],
+[8,760,600,430,568,R,"HC-SR04 VCC → ray + mini"],[8,760,680,440,578,K,"HC-SR04 GND → ray − mini"],[8,180,670,760,630,G,"D5 → TRIG",1],[8,760,655,525,598,B,"ECHO → cột 14, hàng a (đầu 10k)"],[8,180,695,565,638,P,"D18 ← cột 18, hàng e (giữa 10k và 20k)",1]];
+function el(n,a,p){const e=document.createElementNS(NS,n);for(const k in a)e.setAttribute(k,a[k]);(p||svg).appendChild(e);return e}
+function tx(x,y,t,a){const e=el("text",Object.assign({x,y},a||{}));e.textContent=t;return e}
+const defs=el("defs",{});
+[["h",315,222],["h2",390,563]].forEach(([id,x,y])=>{const p=el("pattern",{id,width:10,height:10,patternUnits:"userSpaceOnUse",x,y},defs);el("rect",{x:3.5,y:3.5,width:3,height:3,rx:.6,fill:"var(--hole)"},p)});
+el("marker",{id:"arrow",viewBox:"0 0 10 10",refX:8,refY:5,markerWidth:6,markerHeight:6,orient:"auto"},defs);
+tx(20,20,"NODE ỐNG: breadboard 830 lỗ",{"font-weight":600,"font-size":13});
+el("rect",{x:300,y:190,width:660,height:190,rx:8,fill:"var(--board)",stroke:"var(--line)"});
+el("rect",{x:315,y:227,width:630,height:50,fill:"url(#h)"});el("rect",{x:315,y:295,width:630,height:50,fill:"url(#h)"});
+[[202,R],[212,B]].forEach(([y,c])=>{el("line",{x1:340,x2:850,y1:y-6,y2:y-6,stroke:c,"stroke-width":1.2,opacity:.7});el("rect",{x:345,y:y-5,width:500,height:10,fill:"url(#h)"})});
+tx(322,205,"+",{fill:R});tx(322,215,"−");
+for(let c=1;c<=63;c+=7)tx(320+(c-1)*10-3,222,c,{"font-size":8,opacity:.7});
+tx(880,385,"mạch bơm đi cực vít, không qua breadboard",{"text-anchor":"end","font-size":10});
+el("line",{x1:20,x2:960,y1:510,y2:510,stroke:"var(--line)","stroke-dasharray":"4 4"});
+tx(20,532,"NODE BỒN: breadboard mini 400 lỗ",{"font-weight":600,"font-size":13});
+el("rect",{x:380,y:545,width:330,height:175,rx:8,fill:"var(--board)",stroke:"var(--line)"});
+el("rect",{x:390,y:593,width:310,height:50,fill:"url(#h2)"});el("rect",{x:390,y:653,width:310,height:50,fill:"url(#h2)"});
+[[568,R],[578,B]].forEach(([y,c])=>{el("line",{x1:395,x2:650,y1:y-6,y2:y-6,stroke:c,"stroke-width":1.2,opacity:.7});el("rect",{x:390,y:y-5,width:260,height:10,fill:"url(#h2)"})});
+tx(384,571,"+",{fill:R});tx(384,581,"−");
+for(let c=1;c<=30;c+=5)tx(395+(c-1)*10-2,590,c,{"font-size":8,opacity:.7});
+parts.forEach(([x,y,w,h,a,b])=>{el("rect",{x,y,width:w,height:h,rx:7,fill:"var(--mod)",stroke:"var(--modl)","stroke-width":1});
+tx(x+w/2,y+(h>100?22:h/2-4),a,{"text-anchor":"middle","font-weight":600});tx(x+w/2,y+(h>100?40:h/2+12),b,{"text-anchor":"middle","font-size":10,opacity:.8})});
+[["VIN",205],["GND",230],["D27",312],["D26",337],["VIN",600],["GND",625],["D5",670],["D18",695]].forEach(([n,y])=>{el("circle",{cx:180,cy:y,r:3.5,fill:"var(--modl)"});tx(172,y+3,n,{"text-anchor":"end","font-size":10})});
+[["TRIG",630],["ECHO",655],["VCC",600],["GND",680]].forEach(([n,y])=>tx(768,y+3,n,{"font-size":10}));
+el("rect",{x:30,y:384,width:620,height:96,rx:8,fill:"none",stroke:"var(--line)","stroke-dasharray":"4 4"});
+tx(42,398,"Mạch bơm, tách biệt với ESP32",{});
+const dyn=[];
+function add(step,n,a){const e=el(n,a);e.dataset.s=step;dyn.push(e);return e}
+function addT(step,x,y,t,a){const e=tx(x,y,t,a);e.dataset.s=step;dyn.push(e)}
+function res(step,x,y,w,h,lab,lx,ly){add(step,"rect",{x,y,width:w,height:h,rx:3,fill:"#c9a273",stroke:"#6b4a22"});addT(step,lx,ly,lab,{"text-anchor":"middle","font-size":9})}
+res(3,392,247,36,10,"10k",410,243);res(3,426,214,8,16,"20k",444,226);
+res(8,527,613,36,10,"10k",545,609);res(8,561,583,8,16,"20k",579,595);
+W.forEach(([s,x1,y1,x2,y2,c,l,h])=>{
+const d=h?`M${x1} ${y1} C${x1+(x2-x1)*.7} ${y1},${x2} ${y1+(y2-y1)*.3},${x2} ${y2}`:`M${x1} ${y1} C${x1} ${(y1+y2)/2},${x2} ${(y1+y2)/2},${x2} ${y2}`;
+add(s,"path",{d,fill:"none",stroke:c,"stroke-width":3,"stroke-linecap":"round",opacity:.92});add(s,"circle",{cx:x2,cy:y2,r:3.5,fill:c})});
+const nav=document.getElementById("nav");let cur=1,all=false;
+const mk=(t,f)=>{const b=document.createElement("button");b.textContent=t;b.onclick=f;nav.appendChild(b);return b};
+const prev=mk("Bước trước",()=>go(cur-1)),next=mk("Bước sau",()=>go(cur+1)),pills=steps.map((s,i)=>mk(String(i+1),()=>go(i+1))),sa=mk("Hiện tất cả",()=>{all=!all;render()});
+function go(n){cur=Math.max(1,Math.min(steps.length,n));all=false;render()}
+function render(){
+dyn.forEach(e=>{const s=+e.dataset.s;e.style.display=(all||s<=cur)?"":"none";e.style.opacity=(!all&&s===cur)?1:(s<cur||all?.55:1)});
+pills.forEach((b,i)=>b.classList.toggle("on",i+1===cur&&!all));sa.classList.toggle("on",all);prev.disabled=cur===1;next.disabled=cur===steps.length;
+document.getElementById("t").textContent=`Bước ${cur}: ${steps[cur-1][0]}`;document.getElementById("d").textContent=steps[cur-1][1];
+const it=W.filter(w=>w[0]===cur).map(w=>`<li><span class="sw" style="background:${w[5]}"></span>${w[6]}</li>`);
+if(cur===3)it.push("<li>Điện trở 10k: cột 8 ↔ cột 12 (hàng c)</li><li>Điện trở 20k: cột 12 (hàng a) ↔ ray − trên</li>");
+if(cur===8)it.push("<li>Điện trở 10k: cột 14 ↔ cột 18 (hàng c)</li><li>Điện trở 20k: cột 18 (hàng a) ↔ ray − mini</li>");
+document.getElementById("l").innerHTML=it.join("")||"<li>Chưa đấu dây, chỉ bố trí các linh kiện.</li>"}
+render();
+</script>
+</body>
+</html>
