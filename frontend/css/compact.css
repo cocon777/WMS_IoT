@@ -12,3 +12,69 @@
 .site-picker{white-space:nowrap}.user-cell{display:flex;flex-direction:column;gap:4px}.user-cell strong{font-size:12px}.user-cell small{font-family:JetBrains Mono,monospace;color:#94a3b8;font-size:10px}.data-table td small{display:block;color:#94a3b8;font-size:10px;margin-top:3px}
 
 .refresh-feedback{position:fixed;right:20px;bottom:20px;z-index:150;max-width:min(520px,calc(100vw - 40px));padding:12px 16px;border:1px solid #bae6fd;border-radius:12px;background:#f0f9ff;color:#075985;box-shadow:0 8px 28px #0f172a20;font-size:12px;line-height:1.5}.refresh-feedback[data-state=error]{border-color:#fecdd3;background:#fff1f2;color:#9f1239}
+
+/* Prioritize the two trends; node cards below retain connection state and sample age. */
+@media(min-width:901px){
+  #dashboard{grid-template-rows:84px minmax(340px,1fr) 120px}
+  .compact-operation{grid-template-columns:minmax(175px,.55fr) minmax(0,1.8fr) minmax(255px,.8fr)}
+  .read-only .compact-operation{grid-template-columns:minmax(175px,.55fr) minmax(0,2.6fr)}
+  #devices.node-stack{grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:minmax(0,1fr)}
+  .compact-operation .tank-card{padding:12px}
+  .compact-operation .tank-card h3{font-size:13px}
+  .compact-operation .tank-card .hint{font-size:10px}
+  #digital-twin-container svg{max-height:220px}
+  .pump-actions{flex-wrap:wrap}
+  .pump-actions button{flex:1 1 auto}
+}
+.compact-operation .trend-card>.card-heading{flex-direction:column;align-items:flex-start;gap:6px}
+.compact-operation .range-tabs{flex-wrap:wrap}
+.compact-operation #dashboard-history{grid-template-columns:minmax(0,1fr)!important;grid-template-rows:repeat(2,minmax(0,1fr));gap:8px!important}
+.compact-operation .mini-chart .chart{max-height:none;width:100%}
+#devices article{justify-content:center;gap:6px}
+#devices h3{max-width:none;min-width:0;overflow-wrap:anywhere}
+#devices .card-heading{align-items:center}
+#devices .node-status{display:flex;gap:4px;align-items:center;flex-shrink:0;flex-wrap:wrap;justify-content:flex-end}
+#devices .node-age{font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.5;padding:6px 9px;margin:0;border-left:3px solid #0ea5e9;background:#f1f5f9;border-radius:5px;overflow-wrap:anywhere}
+#devices .node-age.stale{background:#fffbeb;border-left-color:#f59e0b}
+.latest-command .command-purpose{font-size:11px;line-height:1.45;font-weight:700;color:#0f172a;margin:0 0 5px;overflow-wrap:anywhere}
+.command-purpose:empty{display:none}
+.leak-monitor{margin-top:4px;margin-bottom:8px}
+.leak-monitor .mode-row label{font-size:11px}
+#command-panel #leak-toggle{width:38px;height:22px;min-width:38px;padding:3px;border:0;border-radius:20px;background:#94a3b8;box-shadow:none;flex-shrink:0}
+#leak-toggle span{display:block;width:16px;height:16px;border-radius:50%;background:white;box-shadow:0 1px 3px #0f172a30;transition:transform .16s}
+#command-panel #leak-toggle[aria-checked=true]{background:#0284c7}
+#leak-toggle[aria-checked=true] span{transform:translateX(16px)}
+#command-panel #leak-toggle[data-state=mixed]{background:#d97706}
+#leak-toggle[data-state=mixed] span{transform:translateX(8px)}
+#leak-toggle:disabled{opacity:.6;cursor:not-allowed}
+#leak-toggle[aria-busy=true]{cursor:wait}
+#leak-state{min-width:18px;text-align:right}
+#leak-feedback{margin:5px 0 0;line-height:1.4}
+#command-panel .pump-actions{display:grid;grid-template-columns:1.2fr 1fr 1fr}
+#command-panel .pump-actions button{min-width:0;padding:8px 5px!important;font-size:clamp(10px,.75vw,11px)!important}
+#command-panel{overflow:auto}
+#command-panel .latest-command{flex-shrink:0}
+#command-panel .mode-explainer{margin:6px 0 8px}
+
+/* All application popups share this dialog. The ID wins over injected reset CSS. */
+#editor{box-sizing:border-box;padding:clamp(18px,2.5vw,28px);width:min(680px,calc(100vw - 32px));max-height:calc(100dvh - 32px);border:1px solid var(--border);border-radius:18px}
+#editor-content>h2{margin:0 0 18px;line-height:1.4}
+#editor-content>form{display:grid;gap:14px;min-width:0}
+#editor-content form>p{margin:0;line-height:1.6}
+#editor-content form>pre{margin:0;padding:12px;background:#f8fafc;border-radius:10px}
+#editor-content form>.card-heading{margin:0}
+#editor #editor-close{margin-top:18px}
+
+@media(max-width:900px){
+  #dashboard{min-height:1040px;grid-template-rows:170px minmax(600px,1fr) 240px}
+  .compact-operation .trend-card{grid-column:2;grid-row:1}
+  #devices.node-stack{grid-column:auto;grid-row:auto}
+  .read-only .compact-operation{grid-template-rows:1fr}
+}
+@media(max-width:640px){
+  #dashboard{min-height:0}
+  .compact-operation .trend-card{min-height:320px}
+  #devices.node-stack{min-height:150px!important}
+  #devices .node-age{font-size:10px}
+  #editor{padding:18px}
+}
